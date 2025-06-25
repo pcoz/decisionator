@@ -8,9 +8,8 @@
 
 **Decisionator** is a Python tool that analyzes complex real-world decision problems using three advanced, Transactional Analysis-based psychological decision-making models. It leverages OpenAI's API to provide multi-model reasoning, full traceability of all considerations, and generates a structured Word report (`.docx`) summarizing the findings.
 
-This tool is ideal for business analysts, technical leaders, organizational psychologists, and anyone who needs a rigorous, multi-perspective breakdown of important choices.
+This tool is ideal for business analysts, technical leaders, organizational psychologists, and anyone who needs a rigorous, multi-perspective breakdown of important choices. A PDF is included in this repo, which explains the psychological decision-making models implemented by the code.
 
-**Note**: A PDF paper is included in this repo, which explains the psychological decision-making models which the code implements.
 ---
 
 ## Features
