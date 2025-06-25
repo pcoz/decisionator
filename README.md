@@ -10,6 +10,7 @@
 
 This tool is ideal for business analysts, technical leaders, organizational psychologists, and anyone who needs a rigorous, multi-perspective breakdown of important choices.
 
+**Note**: A PDF paper is included in this repo, which explains the psychological decision-making models which the code implements.
 ---
 
 ## Features
