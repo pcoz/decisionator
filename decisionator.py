@@ -163,89 +163,195 @@ class DocAssembler:
                 else:
                     self.doc.add_paragraph(line)
 
-from docx.shared import Pt, RGBColor, Inches
+from docx.shared import Inches
+from docx.oxml.ns import qn
 from docx.oxml import parse_xml
 from docx.oxml.ns import nsdecls
 
 def style_table(table):
-    '''
-    Applies table formatting for Word output.
-    Adds black borders to all cells and highlights header row.
-    '''
-    # 1. Apply black border to all cells
+    """
+    Applies black borders to all cells, shades the header row, bolds header text,
+    and sets column widths: wide for 'Consideration', narrow for 'Type'/'Score'.
+    """
+    
+    # 1. Set table-level border style first
+    table.style = 'Table Grid'
+    
+    # 2. Apply black borders to all cells using a more direct approach
     for row in table.rows:
         for cell in row.cells:
+            # Set borders using the paragraph format approach
             tc = cell._tc
             tcPr = tc.get_or_add_tcPr()
-            tcBorders = tcPr.find(qn('w:tcBorders'))
-            if tcBorders is not None:
-                tcPr.remove(tcBorders)
-            borders_xml = (
-                '<w:tcBorders %s>'
-                '  <w:top w:val="single" w:sz="6" w:color="000000"/>'
-                '  <w:left w:val="single" w:sz="6" w:color="000000"/>'
-                '  <w:bottom w:val="single" w:sz="6" w:color="000000"/>'
-                '  <w:right w:val="single" w:sz="6" w:color="000000"/>'
-                '</w:tcBorders>' % nsdecls('w')
-            )
-            tcPr.append(parse_xml(borders_xml))
-    # 2. Shade top row light grey & bold text
+            
+            # Remove any existing borders
+            for borders in tcPr.xpath('.//w:tcBorders'):
+                tcPr.remove(borders)
+            
+            # Add comprehensive border styling
+            borders_xml = '''
+            <w:tcBorders xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                <w:top w:val="single" w:sz="4" w:space="0" w:color="000000"/>
+                <w:left w:val="single" w:sz="4" w:space="0" w:color="000000"/>
+                <w:bottom w:val="single" w:sz="4" w:space="0" w:color="000000"/>
+                <w:right w:val="single" w:sz="4" w:space="0" w:color="000000"/>
+                <w:insideH w:val="single" w:sz="4" w:space="0" w:color="000000"/>
+                <w:insideV w:val="single" w:sz="4" w:space="0" w:color="000000"/>
+            </w:tcBorders>'''
+            
+            tcPr.append(parse_xml(borders_xml.strip()))
+
+    # 2. Shade and bold header row
     hdr_cells = table.rows[0].cells
     for cell in hdr_cells:
-        cell_paragraph = cell.paragraphs[0]
-        for run in cell_paragraph.runs:
-            run.font.bold = True
-        # Light grey shading (RGB #D9D9D9)
+        # Bold all text in header cells
+        for paragraph in cell.paragraphs:
+            for run in paragraph.runs:
+                run.font.bold = True
+            # If no runs exist, create one and make it bold
+            if not paragraph.runs:
+                run = paragraph.runs[0] if paragraph.runs else paragraph.add_run(paragraph.text)
+                run.font.bold = True
+        
+        # Add shading to header cells
         cell._tc.get_or_add_tcPr().append(
-            parse_xml(r'<w:shd {} w:fill="D9D9D9"/>'.format(nsdecls('w')))
+            parse_xml(f'<w:shd {nsdecls("w")} w:fill="D9D9D9"/>')
         )
-    # 3. Set column widths (minimum for headings & score columns)
-    # WARNING: Word often ignores explicit widths, but setting helps.
-    if len(hdr_cells) == 3:
-        hdr_cells[0].width = Inches(4.0)  # Main consideration text, wider
-        hdr_cells[1].width = Inches(1.1)  # Positive/Negative, narrow
-        hdr_cells[2].width = Inches(0.7)  # Score, narrow
 
-def get_heatmap_color(score, min_neg, max_pos, orientation):
+    # 3. Set column widths (tight for Type/Score)
+    if len(hdr_cells) == 3:
+        # Set widths for header row
+        hdr_cells[0].width = Inches(5.1)  # Consideration (adjust as needed)
+        hdr_cells[1].width = Inches(0.65)  # Type (as narrow as practical)
+        hdr_cells[2].width = Inches(0.65)  # Score (as narrow as practical)
+        
+        # Set widths for all other rows
+        for row in table.rows:
+            if len(row.cells) >= 3:
+                row.cells[0].width = Inches(5.1)
+                row.cells[1].width = Inches(0.65)
+                row.cells[2].width = Inches(0.65)
+
+from docx.oxml.ns import qn, nsdecls
+from docx.oxml import parse_xml
+
+def add_considerations_table(docasm, considerations, min_neg, max_pos):
+    """
+    Adds a formatted consideration table. No header repetition, no row-breaking tricks.
+    Ensures borders are preserved when applying heatmap colors.
+    """
+    table = docasm.add_table(rows=1, cols=3)
+    hdr_cells = table.rows[0].cells
+    hdr_cells[0].text = 'Consideration'
+    hdr_cells[1].text = 'Type'
+    hdr_cells[2].text = 'Score'
+    
+    # Apply initial styling (including borders)
+    style_table(table)
+    
+    for row in considerations:
+        row_cells = table.add_row().cells
+        row_cells[0].text = str(row.text)
+        row_cells[1].text = str(row.type)
+        row_cells[2].text = str(row.score)
+        
+        # Apply heatmap coloring while preserving borders
+        if row.score is not None and (float(row.score) < 0 or float(row.score) > 0):
+            hexcolor = get_heatmap_color(row.score, min_neg, max_pos, row.type)
+            if hexcolor:
+                for cell in row_cells:
+                    tc = cell._tc
+                    tcPr = tc.get_or_add_tcPr()
+                    
+                    # Add shading
+                    shading_xml = f'<w:shd {nsdecls("w")} w:fill="{hexcolor}"/>'
+                    tcPr.append(parse_xml(shading_xml))
+                    
+                    # Re-apply borders after shading to ensure they're not overridden
+                    borders_xml = f'''
+                    <w:tcBorders {nsdecls('w')}>
+                        <w:top w:val="single" w:sz="4" w:space="0" w:color="000000"/>
+                        <w:left w:val="single" w:sz="4" w:space="0" w:color="000000"/>
+                        <w:bottom w:val="single" w:sz="4" w:space="0" w:color="000000"/>
+                        <w:right w:val="single" w:sz="4" w:space="0" w:color="000000"/>
+                    </w:tcBorders>'''
+                    
+                    # Remove existing borders first
+                    for existing_borders in tcPr.xpath('.//w:tcBorders'):
+                        tcPr.remove(existing_borders)
+                    
+                    # Add fresh borders
+                    tcPr.append(parse_xml(borders_xml.strip()))
+        else:
+            # Even for non-colored cells, ensure borders are applied
+            for cell in row_cells:
+                tc = cell._tc
+                tcPr = tc.get_or_add_tcPr()
+                
+                borders_xml = f'''
+                <w:tcBorders {nsdecls('w')}>
+                    <w:top w:val="single" w:sz="4" w:space="0" w:color="000000"/>
+                    <w:left w:val="single" w:sz="4" w:space="0" w:color="000000"/>
+                    <w:bottom w:val="single" w:sz="4" w:space="0" w:color="000000"/>
+                    <w:right w:val="single" w:sz="4" w:space="0" w:color="000000"/>
+                </w:tcBorders>'''
+                
+                # Remove existing borders first
+                for existing_borders in tcPr.xpath('.//w:tcBorders'):
+                    tcPr.remove(existing_borders)
+                
+                # Add fresh borders
+                tcPr.append(parse_xml(borders_xml.strip()))
+
+def get_heatmap_color(score, min_neg, max_pos, type_):
     '''
-    Maps a numerical score and orientation to a color for table cell shading.
-    Used to visually distinguish positive and negative considerations.
+    Maps a numerical score and consideration type to a color for table cell shading.
+    
+    Color logic based on SCORE SIGN, not consideration type:
+    - Any consideration with negative score: Red gradient (light to dark red)
+    - Any consideration with positive score: Green gradient (light to dark green)
+    - Zero scores: No coloring
+    
+    This ensures intuitive coloring where negative scores are always red
+    and positive scores are always green, regardless of the consideration type.
     '''
-    # Handle None and convert to float
     try:
         s = float(score)
     except Exception:
         return None
-    # Negatives
-    if orientation == "negative" and min_neg < 0 and s < 0:
-        t = abs(s) / abs(min_neg) if min_neg != 0 else 0
-        # Interpolate R: 251→255, G: 234→0, B: 234→0
-        r = int(251 + (255-251)*t)  # almost no change
-        g = int(234 - 234*t)        # 234→0
-        b = int(234 - 234*t)        # 234→0
-        return f"{r:02x}{g:02x}{b:02x}"
-    # Positives
-    if orientation == "positive" and max_pos > 0 and s > 0:
-        t = s / max_pos if max_pos != 0 else 0
-        # Interpolate R: 245→0, G: 255→204, B: 245→0
-        r = int(245 - 245*t)       # 245→0
-        g = int(255 - (255-204)*t) # 255→204
-        b = int(245 - 245*t)       # 245→0
-        return f"{r:02x}{g:02x}{b:02x}"
-    # Zero or unrecognized: no shade
+    
+    # Color based purely on score sign, not consideration type
+    if s < 0:
+        # Any negative score gets red coloring
+        if min_neg < 0:
+            t = abs(s) / abs(min_neg) if min_neg != 0 else 0
+            r = int(251 + (255-251)*t)  # 251 -> 255 (light red to dark red)
+            g = int(234 - 234*t)        # 234 -> 0 (reduce green)
+            b = int(234 - 234*t)        # 234 -> 0 (reduce blue)
+            return f"{r:02x}{g:02x}{b:02x}"
+    
+    elif s > 0:
+        # Any positive score gets green coloring
+        if max_pos > 0:
+            t = s / max_pos if max_pos != 0 else 0
+            r = int(245 - 245*t)        # 245 -> 0 (reduce red)
+            g = int(255 - (255-204)*t)  # 255 -> 204 (light green to darker green)
+            b = int(245 - 245*t)        # 245 -> 0 (reduce blue)
+            return f"{r:02x}{g:02x}{b:02x}"
+    
+    # Zero scores or invalid ranges return no color
     return None
 
 def normalized_score(cons):
     '''
     Returns a normalized (possibly negated) score for a consideration,
-    so negative-oriented fields always appear as negative numbers.
+    so negative-oriented types always appear as negative numbers.
     '''
     try:
         val = float(cons.score)
     except Exception:
         val = 0.0
-    # If it's supposed to be negative but is positive, flip it
-    if cons.orientation == "negative" and val > 0:
+    if cons.type == "negative" and val > 0:
         return -val
     return val
 
@@ -262,10 +368,12 @@ def sort_considerations(conslist, negative=True):
         conslist,
         key=lambda x: (float(x.score), str(x.text).lower())
     )
-    
+
+# Deduping utility for deduping very similar "considerations" in the considerations tables.
+# Increase the value of similarity_cutoff (in increments of 0.01) to increase the number of deduped considerations.
 from difflib import SequenceMatcher
 
-def dedupe_considerations(conslist, similarity_cutoff=0.92):
+def dedupe_considerations(conslist, similarity_cutoff=0.95):
     '''
     Deduplicate a list of Consideration objects, both by exact text and near-match (fuzzy).
     - similarity_cutoff: float between 0 and 1.0; higher = stricter.
@@ -291,15 +399,19 @@ def dedupe_considerations(conslist, similarity_cutoff=0.92):
             seen.add(text.lower())
     return deduped
 
-def signed_score(orientation, score):
+def signed_score(type_, score):
     '''
-    Ensures negative considerations have negative scores and positive ones have positive.
-    Used to enforce orientation-appropriate sign in all tables.
+    Ensures negative considerations have negative scores and positive/avoidance ones have positive.
+    Used to enforce type-appropriate sign in all tables.
     '''
     try:
         val = float(score)
     except Exception:
         val = 0.0
+    # Treat 'avoidance' as 'positive'
+    orientation = type_
+    if type_ == "avoidance":
+        orientation = "positive"
     if orientation == "negative" and val > 0:
         return -val
     if orientation == "positive" and val < 0:
@@ -444,11 +556,11 @@ class Consideration:
     text: str
     source_model: str
     source_context: str
-    orientation: str  # 'positive', 'negative', or 'neutral'
+    type: str  # 'positive', 'negative', or 'avoidance'
     option: str = None
     score: float = None
     extra: dict = field(default_factory=dict)
-    field_id: str = None  # <-- Add this line!
+    field_id: str = None
 
 def extract_numeric(val):
     '''
@@ -907,20 +1019,29 @@ Please summarise in clear, everyday language for a general audience.
             return json.dumps({"__error__": error_str})
 
     def _execute_model1(self, problem: str, options, doc, considerations, log_callback=None) -> DecisionResult:
-        if log_callback: log_callback("start", {"model": "model1", "problem": problem})
+        if log_callback:
+            log_callback("start", {"model": "model1", "problem": problem})
         print("Executing Model 1: Democratic Ego State Council")
         ego_responses = []
         for ego_state in self.workflows[DecisionModel.DEMOCRATIC_COUNCIL]["ego_states"]:
+            # Call API with the new prompt (returns a flat list of dicts)
             response = self._call_openai_api(self._ego_state_prompt(problem, ego_state, options))
-            if log_callback: log_callback("ego_response", {"ego_state": ego_state, "raw_response": response})
+            if log_callback:
+                log_callback("ego_response", {"ego_state": ego_state, "raw_response": response})
             if doc:
                 doc.add_heading(f"{ego_state} Ego State Analysis", level=3)
                 try:
                     parsed = json.loads(self._strip_json_code_block(response))
-                    for k, v in parsed.items():
-                        doc.add_paragraph(f"{k}: {v}")
+                    if isinstance(parsed, list):
+                        for item in parsed:
+                            doc.add_paragraph(f"{item.get('type', '')}: {item.get('text', '')} (Option: {item.get('option', '')}, Score: {item.get('score', '')})")
+                    else:
+                        for k, v in parsed.items():
+                            doc.add_paragraph(f"{k}: {v}")
                 except Exception:
                     doc.add_paragraph(f"Raw: {response}")
+    
+            # Parse and extract considerations
             data = self._handle_json_parse(response)
             if self._is_error(data):
                 print("API call failed for ego state:", ego_state, data["__error__"])
@@ -935,47 +1056,37 @@ Please summarise in clear, everyday language for a general audience.
                     )
                 )
             else:
+                # data is expected to be a list of consideration dicts
+                # (If not, skip gracefully)
+                if isinstance(data, list):
+                    for cons in data:
+                        c = Consideration(
+                            text=cons.get("text", ""),
+                            source_model="model1",
+                            source_context=ego_state,
+                            type=cons.get("type", ""),
+                            option=cons.get("option"),
+                            score=cons.get("score"),
+                        )
+                        considerations.append(c)
+                        if log_callback:
+                            log_callback("consideration", asdict(c))
+                # Optionally store an empty EgoStateResponse for backward compatibility
                 ego_responses.append(
-                    map_fields_by_id({**{"ego_state": ego_state}, **data}, EGO_FIELDS_BY_ID, EgoStateResponse)
+                    EgoStateResponse(
+                        ego_state=ego_state,
+                        concerns=[],  # deprecated in new format
+                        hopes=[],
+                        fears=[],
+                        score=0.0,
+                        reasoning=""
+                    )
                 )
-            # Log considerations as steps if logging enabled
-            resp = ego_responses[-1]
-            field_map = [
-                ("concerns", "1"),
-                ("hopes",    "2"),
-                ("fears",    "3"),
-                # Add others as needed (e.g., "reasoning"/"5" if you want, but you'll filter these out)
-            ]
     
-            for attr, field_id in field_map:
-                items = getattr(resp, attr, [])
-                orientation = FIELD_ID_TO_ORIENTATION[field_id]
-                for item in items:
-                    if isinstance(item, dict):
-                        c = Consideration(
-                            text=item.get("text", str(item)),
-                            source_model="model1",
-                            source_context=resp.ego_state,
-                            orientation=orientation,
-                            score=signed_score(orientation, resp.score),
-                            option=item.get("option"),
-                            field_id=field_id
-                        )
-                    else:
-                        c = Consideration(
-                            text=item,
-                            source_model="model1",
-                            source_context=resp.ego_state,
-                            orientation=orientation,
-                            score=signed_score(orientation, resp.score),
-                            option=None,
-                            field_id=field_id
-                        )
-                    considerations.append(c)
-                    if log_callback: log_callback("consideration", asdict(c))
-    
+        # Synthesis prompt (unchanged)
         synthesis_resp = self._call_openai_api(self._council_synthesis_prompt(problem, ego_responses))
-        if log_callback: log_callback("council_synthesis", {"raw_response": synthesis_resp})
+        if log_callback:
+            log_callback("council_synthesis", {"raw_response": synthesis_resp})
         if doc:
             doc.add_heading("Council Synthesis", level=3)
             try:
@@ -994,30 +1105,38 @@ Please summarise in clear, everyday language for a general audience.
                 "consensus_level": 0,
                 "synthesis_reasoning": "API call failed: " + synthesis["__error__"]
             }
-        if log_callback: log_callback("synthesis_parsed", synthesis)
+        if log_callback:
+            log_callback("synthesis_parsed", synthesis)
         decision = self._make_final_decision_model1(problem, ego_responses, synthesis)
-        if log_callback: log_callback("final_decision", asdict(decision))
+        if log_callback:
+            log_callback("final_decision", asdict(decision))
     
         print(f"[DEBUG] considerations: {[asdict(c) for c in considerations]}")
     
         return decision
-    
 
     def _execute_model2(self, problem: str, options, doc, considerations, log_callback=None) -> DecisionResult:
-        if log_callback: log_callback("start", {"model": "model2", "problem": problem})
+        if log_callback:
+            log_callback("start", {"model": "model2", "problem": problem})
         print("Executing Model 2: Second-Order Ego State Negotiations")
         sub_ego_responses = []
         for sub_state in self.workflows[DecisionModel.SECOND_ORDER_NEGOTIATIONS]["sub_ego_states"]:
             response = self._call_openai_api(self._sub_ego_state_prompt(problem, sub_state, options))
-            if log_callback: log_callback("sub_ego_response", {"sub_state": sub_state, "raw_response": response})
+            if log_callback:
+                log_callback("sub_ego_response", {"sub_state": sub_state, "raw_response": response})
             if doc:
                 doc.add_heading(f"{sub_state} Sub-Ego Analysis", level=3)
                 try:
                     parsed = json.loads(self._strip_json_code_block(response))
-                    for k, v in parsed.items():
-                        doc.add_paragraph(f"{k}: {v}")
+                    if isinstance(parsed, list):
+                        for item in parsed:
+                            doc.add_paragraph(f"{item.get('type', '')}: {item.get('text', '')} (Option: {item.get('option', '')}, Score: {item.get('score', '')})")
+                    else:
+                        for k, v in parsed.items():
+                            doc.add_paragraph(f"{k}: {v}")
                 except Exception:
                     doc.add_paragraph(f"Raw: {response}")
+    
             data = self._handle_json_parse(response)
             if self._is_error(data):
                 print("API call failed for sub-ego state:", sub_state, data["__error__"])
@@ -1032,54 +1151,36 @@ Please summarise in clear, everyday language for a general audience.
                     )
                 )
             else:
+                # data is expected to be a list of consideration dicts
+                if isinstance(data, list):
+                    for cons in data:
+                        c = Consideration(
+                            text=cons.get("text", ""),
+                            source_model="model2",
+                            source_context=sub_state,
+                            type=cons.get("type", ""),
+                            option=cons.get("option"),
+                            score=cons.get("score"),
+                        )
+                        considerations.append(c)
+                        if log_callback:
+                            log_callback("consideration", asdict(c))
+                # Optionally store an empty SubEgoStateResponse for legacy/future use
                 sub_ego_responses.append(
-                    map_fields_by_id(
-                        {**{"sub_state": sub_state, "core_function": self._sub_ego_state_desc(sub_state)}, **data},
-                        SUBEGO_FIELDS_BY_ID, SubEgoStateResponse)
+                    SubEgoStateResponse(
+                        sub_state=sub_state,
+                        core_function=self._sub_ego_state_desc(sub_state),
+                        concerns=[],  # deprecated
+                        stance=0,
+                        non_negotiables=[],
+                        reasoning=""
+                    )
                 )
-            resp = sub_ego_responses[-1]
-            # Unified consideration creation
-            field_map = [
-                ("concerns", "1"),
-                ("non_negotiables", "3"),
-                # "stance" ("2") is numeric, skip as not a textual consideration
-                # "reasoning" ("4") can be omitted from consideration objects (unless you want to record, but you'll filter them later)
-            ]
-            for attr, field_id in field_map:
-                items = getattr(resp, attr, [])
-                orientation = FIELD_ID_TO_ORIENTATION[field_id]
-                # "concerns" orientation is "positive" if stance>0 else "negative"
-                for item in items:
-                    # The stance field (int) is used as the "score" for all these
-                    # But we want to flip negatives
-                    final_orientation = orientation if field_id != "1" else ("positive" if resp.stance > 0 else "negative")
-                    if isinstance(item, dict):
-                        c = Consideration(
-                            text=item.get("text", str(item)),
-                            source_model="model2",
-                            source_context=resp.sub_state,
-                            orientation=final_orientation,
-                            score=signed_score(final_orientation, resp.stance),
-                            option=item.get("option"),
-                            field_id=field_id
-                        )
-                    else:
-                        c = Consideration(
-                            text=item,
-                            source_model="model2",
-                            source_context=resp.sub_state,
-                            orientation=final_orientation,
-                            score=signed_score(final_orientation, resp.stance),
-                            option=None,
-                            field_id=field_id
-                        )
-                    considerations.append(c)
-                    if log_callback: log_callback("consideration", asdict(c))
-            # If you want to store "reasoning" as well (field_id="4"), do a similar loop,
-            # but you will filter these out before reporting.
     
+        # Handle cluster dialogues as before
         cluster_results_resp = self._call_openai_api(self._cluster_dialogues_prompt(problem, sub_ego_responses))
-        if log_callback: log_callback("cluster_dialogues", {"raw_response": cluster_results_resp})
+        if log_callback:
+            log_callback("cluster_dialogues", {"raw_response": cluster_results_resp})
         if doc:
             doc.add_heading("Cluster Dialogues", level=3)
             try:
@@ -1092,9 +1193,13 @@ Please summarise in clear, everyday language for a general audience.
         if self._is_error(cluster_results):
             print("API call failed for cluster dialogues:", cluster_results["__error__"])
             cluster_results = {}
-        if log_callback: log_callback("cluster_dialogues_parsed", cluster_results)
+        if log_callback:
+            log_callback("cluster_dialogues_parsed", cluster_results)
+    
+        # Cross-cluster negotiation
         negotiation_results_resp = self._call_openai_api(self._cross_cluster_negotiation_prompt(problem, cluster_results))
-        if log_callback: log_callback("cross_cluster_negotiation", {"raw_response": negotiation_results_resp})
+        if log_callback:
+            log_callback("cross_cluster_negotiation", {"raw_response": negotiation_results_resp})
         if doc:
             doc.add_heading("Cross-Cluster Negotiation", level=3)
             try:
@@ -1107,9 +1212,12 @@ Please summarise in clear, everyday language for a general audience.
         if self._is_error(negotiation_results):
             print("API call failed for cross-cluster negotiation:", negotiation_results["__error__"])
             negotiation_results = {}
-        if log_callback: log_callback("negotiation_results_parsed", negotiation_results)
+        if log_callback:
+            log_callback("negotiation_results_parsed", negotiation_results)
+    
         final_decision = self._conduct_weighted_vote_model2(problem, negotiation_results)
-        if log_callback: log_callback("final_decision", asdict(final_decision))
+        if log_callback:
+            log_callback("final_decision", asdict(final_decision))
     
         print(f"[DEBUG] considerations: {[asdict(c) for c in considerations]}")
     
@@ -1117,7 +1225,8 @@ Please summarise in clear, everyday language for a general audience.
     
 
     def _execute_model3(self, problem: str, options, doc, considerations, log_callback=None) -> DecisionResult:
-        if log_callback: log_callback("start", {"model": "model3", "problem": problem})
+        if log_callback:
+            log_callback("start", {"model": "model3", "problem": problem})
         print("Executing Model 3: Maslow-TA Decision Matrix")
         matrix_cells = []
         for ego_state in ["Parent", "Adult", "Child"]:
@@ -1131,121 +1240,87 @@ Please summarise in clear, everyday language for a general audience.
                 prompt = self._matrix_cell_prompt(problem, ego_state, maslow_level, desc, options)
                 response = self._call_openai_api(prompt)
     
-                if log_callback: log_callback("matrix_cell", {"ego_state": ego_state, "maslow_level": maslow_level, "raw_response": response})
+                if log_callback:
+                    log_callback("matrix_cell", {"ego_state": ego_state, "maslow_level": maslow_level, "raw_response": response})
                 if doc:
                     doc.add_heading(f"{ego_state} x {maslow_level} Cell Analysis", level=3)
                     try:
                         parsed = json.loads(self._strip_json_code_block(response))
-                        for k, v in parsed.items():
-                            doc.add_paragraph(f"{k}: {v}")
+                        if isinstance(parsed, list):
+                            for item in parsed:
+                                doc.add_paragraph(f"{item.get('type', '')}: {item.get('text', '')} (Option: {item.get('option', '')}, Score: {item.get('score', '')})")
+                        else:
+                            for k, v in parsed.items():
+                                doc.add_paragraph(f"{k}: {v}")
                     except Exception:
                         doc.add_paragraph(f"Raw: {response}")
     
-                parsed_preview = self._handle_json_parse(response)
-                if not self._is_error(parsed_preview):
-                    # ----------- ALWAYS handle all items in the cell -----------
-                    cell_items = []
-                    if isinstance(parsed_preview, dict):
-                        cell_items = [parsed_preview]
-                    elif isinstance(parsed_preview, list) and all(isinstance(x, dict) for x in parsed_preview):
-                        cell_items = parsed_preview
-                        print(f"[INFO] LLM returned a list for matrix cell; processing all {len(cell_items)} items.")
-                    else:
-                        print("[WARN] Unexpected LLM response type; skipping.")
-                        cell_items = []
-                    for item in cell_items:
-                        score = extract_numeric(item.get("1", 0.0))
-                        reasoning = item.get("2", "")
-                        option = None
-                        if isinstance(reasoning, dict):
-                            text = reasoning.get("text", "")
-                            option = reasoning.get("option", None)
-                        else:
-                            text = reasoning
-                        orientation = "positive" if score > 0 else ("negative" if score < 0 else "neutral")
-                        # Use signed_score so negatives are actually negative
-                        true_score = signed_score(orientation, score)
+                # Parse and extract considerations (expected as a list)
+                data = self._handle_json_parse(response)
+                if not self._is_error(data) and isinstance(data, list):
+                    for cons in data:
                         c = Consideration(
-                            text=text,
+                            text=cons.get("text", ""),
                             source_model="model3",
                             source_context=f"{ego_state}-{maslow_level}",
-                            orientation=orientation,
-                            score=true_score,
-                            option=option
+                            type=cons.get("type", ""),
+                            option=cons.get("option"),
+                            score=cons.get("score"),
                         )
                         considerations.append(c)
                         if log_callback:
                             log_callback("consideration", asdict(c))
+                # You may wish to handle/report on errors or non-list responses here as appropriate.
     
-                # ----------- Also store all MatrixCell(s) -----------
-                data = self._handle_json_parse(response)
-                if self._is_error(data):
-                    print(f"API call failed for {ego_state} x {maslow_level}:", data["__error__"])
-                    matrix_cells.append(
-                        MatrixCell(
-                            ego_state=ego_state,
-                            maslow_level=maslow_level,
-                            score=0.0,
-                            reasoning="API call failed: " + data["__error__"]
-                        )
-                    )
-                else:
-                    # Always treat as list of dicts or single dict
-                    if isinstance(data, list) and all(isinstance(x, dict) for x in data):
-                        for item in data:
-                            score = extract_numeric(item.get("1", 0.0))
-                            reasoning = item.get("2", "")
-                            if isinstance(reasoning, dict):
-                                text = reasoning.get("text", "")
-                            else:
-                                text = reasoning
-                            matrix_cells.append(
-                                MatrixCell(
-                                    ego_state=ego_state,
-                                    maslow_level=maslow_level,
-                                    score=signed_score("positive" if score > 0 else ("negative" if score < 0 else "neutral"), score),
-                                    reasoning=text
-                                )
-                            )
-                    elif isinstance(data, dict):
-                        score = extract_numeric(data.get("1", 0.0))
-                        reasoning = data.get("2", "")
-                        if isinstance(reasoning, dict):
-                            text = reasoning.get("text", "")
-                        else:
-                            text = reasoning
-                        matrix_cells.append(
-                            MatrixCell(
-                                ego_state=ego_state,
-                                maslow_level=maslow_level,
-                                score=signed_score("positive" if score > 0 else ("negative" if score < 0 else "neutral"), score),
-                                reasoning=text
-                            )
-                        )
+                # MatrixCell for utility calculations, use the highest scored 'positive' or lowest 'negative' for each cell, or aggregate as desired
+                # We'll use the "strongest" score for each cell for backward compatibility with utility calculation
+                cell_score = 0.0
+                cell_reasoning = ""
+                if isinstance(data, list) and data:
+                    # Prefer the first positive, otherwise the strongest
+                    positive_scores = [float(item.get("score", 0)) for item in data if item.get("type") == "positive"]
+                    if positive_scores:
+                        cell_score = max(positive_scores)
                     else:
-                        print(f"[WARN] Unexpected matrix cell data structure for {ego_state} x {maslow_level}: {type(data)}")
-                        matrix_cells.append(
-                            MatrixCell(
-                                ego_state=ego_state,
-                                maslow_level=maslow_level,
-                                score=0.0,
-                                reasoning="Unexpected matrix cell data structure."
-                            )
-                        )
-        if log_callback: log_callback("matrix_cells_collected", [asdict(cell) for cell in matrix_cells])
+                        # fallback: get the most positive or least negative
+                        all_scores = [float(item.get("score", 0)) for item in data]
+                        if all_scores:
+                            cell_score = max(all_scores, key=abs)
+                    # Use the reasoning/text from the first consideration
+                    cell_reasoning = data[0].get("text", "")
+                elif isinstance(data, dict):
+                    cell_score = float(data.get("score", 0))
+                    cell_reasoning = data.get("text", "")
+                else:
+                    cell_score = 0.0
+                    cell_reasoning = "API call failed or returned unexpected format."
+                matrix_cells.append(
+                    MatrixCell(
+                        ego_state=ego_state,
+                        maslow_level=maslow_level,
+                        score=cell_score,
+                        reasoning=cell_reasoning
+                    )
+                )
+    
+        if log_callback:
+            log_callback("matrix_cells_collected", [asdict(cell) for cell in matrix_cells])
         tier_results, mitigations = self._check_tiers_model3(problem, matrix_cells)
-        if log_callback: log_callback("tier_results", {"tier_results": tier_results, "mitigations": mitigations})
+        if log_callback:
+            log_callback("tier_results", {"tier_results": tier_results, "mitigations": mitigations})
         if mitigations:
             for m in mitigations:
                 print("Mitigation needed:", m)
                 if doc:
                     doc.add_paragraph(f"Mitigation needed: {m}", style="Intense Quote")
         final_decision = self._calculate_utility_model3(problem, matrix_cells, tier_results)
-        if log_callback: log_callback("final_decision", asdict(final_decision))
-        
+        if log_callback:
+            log_callback("final_decision", asdict(final_decision))
+    
         print(f"[DEBUG] considerations: {[asdict(c) for c in considerations]}")
     
         return final_decision
+    
     
     
     
@@ -1273,24 +1348,27 @@ Problem: {problem}
 Options:
 {option_str}
 
-For each concern, hope, or fear, specify *exactly which option it applies to* by copying the full text of the option from the list above (do not make up new text or use abbreviations).
+For each option, identify up to three types of consideration:
+1. **Positive Reason**: A reason to choose the option, based on a positive or desirable outcome if it is chosen.
+2. **Negative Reason**: A reason to avoid the option, based on a negative or undesirable outcome if it is chosen.
+3. **Avoidance/Preventative Reason**: A reason to choose the option as a safeguard, specifically because NOT choosing it would result in a negative or undesirable outcome.
 
-Respond with valid JSON and these keys ONLY (use the numeric IDs):
-1: [{{"text": "...", "option": "Paste the *exact* option text here"}}, ...]  (main concerns from this perspective)
-2: [{{"text": "...", "option": "Paste the *exact* option text here"}}, ...]  (positive outcomes hoped for)
-3: [{{"text": "...", "option": "Paste the *exact* option text here"}}, ...]  (negative outcomes feared)
-4: numerical score from -10 (strongly against) to +10 (strongly for)
-5: detailed explanation of this ego state's analysis and position
+**For each consideration, include:**
+- "type": one of "positive", "negative", or "avoidance"
+- "text": the explanation
+- "option": the exact option text it refers to (copy from above)
+- "score": from -10 (strongly against) to +10 (strongly for)
 
-Example:
-{{
-  "1": [{{"text": "concern a", "option": "Option Text Here 1"}}, {{"text": "concern b", "option": "Option Text Here 2"}}],
-  "2": [{{"text": "hope a", "option": "Option Text Here 3"}}],
-  "3": [{{"text": "fear a", "option": "Option Text Here 1"}}],
-  "4": 3,
-  "5": "long explanation here"
-}}
+**Respond in valid JSON, as a flat list:**  
+[
+  {{"type": "positive", "text": "...", "option": "Option Text Here", "score": 8}},
+  {{"type": "negative", "text": "...", "option": "Option Text Here", "score": -6}},
+  {{"type": "avoidance", "text": "...", "option": "Option Text Here", "score": 7}}
+]
+
+Only include real, relevant considerations. Omit any type if there are no applicable reasons for that option.
 '''
+
 
     def _council_synthesis_prompt(self, problem, ego_responses):
         return f'''
@@ -1338,26 +1416,24 @@ Options:
 
 {sub_state}: {self._sub_ego_state_desc(sub_state)}
 
-For each concern or requirement, specify *exactly which option it applies to* by copying the full text of the option from the list above (do not make up new text or use abbreviations).
+For each option, identify up to three types of consideration:
+1. **Positive Reason**: A reason to choose the option, based on a positive or desirable outcome if it is chosen.
+2. **Negative Reason**: A reason to avoid the option, based on a negative or undesirable outcome if it is chosen.
+3. **Avoidance/Preventative Reason**: A reason to choose the option as a safeguard, specifically because NOT choosing it would result in a negative or undesirable outcome.
 
-Respond with valid JSON and these keys ONLY:
-1: [{{"text": "...", "option": "Paste the *exact* option text here"}}, ...]   // (list of main concerns from this sub-state)
-2: integer stance from -10 (strongly against) to +10 (strongly for)
-3: [{{"text": "...", "option": "Paste the *exact* option text here"}}, ...]   // (list of absolute requirements or red lines)
-4: detailed explanation of this sub-state's position
+**For each consideration, include:**
+- "type": one of "positive", "negative", or "avoidance"
+- "text": the explanation
+- "option": the exact option text it refers to (copy from above)
+- "score": from -10 (strongly against) to +10 (strongly for)
 
-Example:
-{{
-  "1": [{{"text": "concern a", "option": "Option Text Here 1"}}, {{"text": "concern b", "option": "Option Text Here 2"}}],
-  "2": 0,
-  "3": [{{"text": "requirement a", "option": "Option Text Here 3"}}],
-  "4": "explanation"
-}}
+**Respond in valid JSON, as a flat list:**  
+[
+  {{"type": "positive", "text": "...", "option": "Option Text Here", "score": 8}},
+  {{"type": "negative", "text": "...", "option": "Option Text Here", "score": -6}},
+  {{"type": "avoidance", "text": "...", "option": "Option Text Here", "score": 7}}
+]
 '''
-
-
-
-
 
     def _cluster_dialogues_prompt(self, problem, sub_ego_responses):
         return f'''
@@ -1410,7 +1486,7 @@ Provide results in JSON format:
 
     def _matrix_cell_prompt(self, problem, ego_state, maslow_level, maslow_desc, options):
         option_str = "\n".join([f"- {opt['text']}" for opt in options]) if options else ""
-        return f'''
+        return f"""
 Evaluate how the decision impacts {maslow_level} needs from the {ego_state} ego state perspective.
 
 Problem: {problem}
@@ -1424,16 +1500,25 @@ Options:
 
 {maslow_level}: {maslow_desc}
 
-Respond in JSON using these keys only:
-1: numerical score from -10 (strongly against/negative impact) to +10 (strongly for/positive impact)
-2: {{"text": "detailed explanation", "option": "Paste the *exact* option text here"}}  # Explain which option this cell refers to
+For each option, identify up to three types of consideration:
+1. **Positive Reason**: A reason to choose the option, based on a positive or desirable outcome if it is chosen.
+2. **Negative Reason**: A reason to avoid the option, based on a negative or undesirable outcome if it is chosen.
+3. **Avoidance/Preventative Reason**: A reason to choose the option as a safeguard, specifically because NOT choosing it would result in a negative or undesirable outcome.
 
-Example:
-{{
-  "1": 4,
-  "2": {{"text": "explanation here", "option": "Option Text Here 1"}}
-}}
-'''
+For each consideration, include:
+- "type": one of "positive", "negative", or "avoidance"
+- "text": the detailed explanation
+- "option": the exact option text it refers to (copy from above)
+- "score": from -10 (strongly against) to +10 (strongly for)
+
+Respond in valid JSON, as a flat list:
+[
+  {{"type": "positive", "text": "...", "option": "Option Text Here", "score": 7}},
+  {{"type": "avoidance", "text": "...", "option": "Option Text Here", "score": 5}},
+  ...
+]
+"""
+
 
 
     def _summarize_model_output_prompt(self, problem: str, model_output: Dict[str, Any]) -> str:
@@ -1762,7 +1847,7 @@ def main():
     controller = WorkflowController()
     processor = ConsiderationProcessor()
 
-    # ==== NEW: Decision Problem section (H1), Question (H2), Options (H2) ====
+    # ==== Problem and Options Section ====
     docasm.add_heading("Problem Statement", level=1)
     docasm.add_heading("Original Question", level=2)
     if is_markdown(problem):
@@ -1770,7 +1855,7 @@ def main():
     else:
         docasm.add_paragraph(problem.strip())
 
-    # ==== Extract options for the decision problem ====
+    # ==== Extract options ====
     print("\nDetecting decision options in the problem statement...")
     options = controller.extract_options(problem)
     if not options:
@@ -1780,7 +1865,6 @@ def main():
     for opt in options:
         print(f"{opt['id']}: {opt['text']}")
 
-    # --- Print Options as their own section ---
     docasm.add_heading("Options Considered", level=2)
     for opt in options:
         docasm.add_paragraph(f"{opt['id']}: {opt['text']}")
@@ -1802,15 +1886,22 @@ def main():
     everyday_summaries = {}
     steps_by_model = {}
 
-    # ==== MOVED: All Decision Considerations by Option (Chapter 3) ====
+    # ==== Considerations by Option (Chapter 3) ====
     docasm.add_page_break()
     docasm.add_heading("Decision Considerations (by Option)", level=1)
     docasm.add_paragraph(
-        "This section lists every single consideration raised by the models, grouped by decision option. "
-        "Each table shows the consideration text, whether it is positive or negative, and any associated score."
+        "The considerations listed below are grouped by decision option and categorized as follows:\n"
+        "• **Negative:** Arguments against choosing this option, based on possible negative outcomes if it is chosen. "
+        "These are typically shown with negative scores.\n"
+        "• **Avoidance:** Arguments in favor of this option, specifically because *not* choosing it would lead to negative consequences. "
+        "These are preventative or risk-avoiding reasons and are scored positively.\n"
+        "• **Positive:** Arguments directly in favor of this option, based on desirable outcomes if it is chosen. "
+        "These also have positive scores.\n\n"
+        "Within each table, considerations are ordered by score from most negative to most positive, regardless of category. "
+        "Avoidance and positive reasons are mingled, not separated. Zero-scored or neutral considerations are listed at the end."
     )
-
-    # --- Models run and considerations collected here ---
+    
+    # --- Run models and collect considerations ---
     for i, model in enumerate(models):
         model_label = model.value
         print(f"\n{'='*10} Running Model {i+1}: {model.name.replace('_', ' ').title()} {'='*10}")
@@ -1826,114 +1917,63 @@ def main():
             considerations=temp_considerations,
             log_callback=log_step
         )
-        print(f"[MAIN] About to call add_many with {len(temp_considerations)} considerations: {temp_considerations}")
         processor.add_many(temp_considerations)
         results[model_label] = result
         steps_by_model[model_label] = model_steps
-
+    
         everyday_prompt = controller._everyday_language_summary_prompt(problem, asdict(result))
         everyday_summary = controller._call_openai_api(everyday_prompt)
         everyday_summaries[model_label] = everyday_summary
-
-    # -- Fetch from in-memory processor, grouped by option --
+    
+    # -- Group considerations by option --
     grouped = {opt['text']: processor.by_option_text(opt['text']) for opt in options}
     general_cons = processor.general()
     all_cons = processor.all()
-
-    ALLOWED_FIELD_IDS = {"1", "2", "3"}
-
-    # ---- Compute normalization for all considerations (across all options) ----
-    neg_scores = [float(c.score) for c in all_cons if getattr(c, 'field_id', None) in ALLOWED_FIELD_IDS and c.orientation == "negative" and c.score is not None and float(c.score) < 0]
-    pos_scores = [float(c.score) for c in all_cons if getattr(c, 'field_id', None) in ALLOWED_FIELD_IDS and c.orientation == "positive" and c.score is not None and float(c.score) > 0]
+    
+    # ---- Compute normalization for all considerations ----
+    neg_scores = [float(c.score) for c in all_cons if c.type == "negative" and c.score is not None and float(c.score) < 0]
+    pos_scores = [float(c.score) for c in all_cons if c.type in ("positive", "avoidance") and c.score is not None and float(c.score) > 0]
     min_neg = min(neg_scores) if neg_scores else -1
     max_pos = max(pos_scores) if pos_scores else 1
-
+    
     for opt in options:
         opt_text = opt['text']
         conslist = grouped.get(opt_text, [])
-        conslist = [c for c in conslist if getattr(c, 'field_id', None) in ALLOWED_FIELD_IDS]
-        # Dedupe both exact and near-match
-        conslist = dedupe_considerations(conslist)
-
+        conslist = dedupe_considerations(conslist, similarity_cutoff=0.95)  # tweak this value as needed
+    
         docasm.add_heading(f"{opt['id']}: {opt['text']}", level=2)
         if not conslist:
             docasm.add_paragraph("No considerations for this option.")
             continue
-
-        negatives = sorted(
-            [c for c in conslist if c.orientation == "negative" and float(c.score) < 0],
-            key=lambda x: (float(x.score), str(x.text).lower())
+    
+        # Unified sorting: all relevant types, sorted by score
+        all_cons_relevant = [c for c in conslist if c.type in {"negative", "avoidance", "positive"}]
+        all_cons_sorted = sorted(
+            all_cons_relevant,
+            key=lambda c: (float(c.score) if c.score is not None else 0, str(c.text).lower())
         )
-        zeros = sorted(
-            [c for c in conslist if float(c.score) == 0],
-            key=lambda x: str(x.text).lower()
-        )
-        positives = sorted(
-            [c for c in conslist if c.orientation == "positive" and float(c.score) > 0],
-            key=lambda x: (float(x.score), str(x.text).lower())
-        )
-        ordered_conslist = negatives + zeros + positives
-
-        table = docasm.add_table(rows=1, cols=3)
-        hdr_cells = table.rows[0].cells
-        hdr_cells[0].text = 'Consideration'
-        hdr_cells[1].text = 'Positive/Negative'
-        hdr_cells[2].text = 'Score'
-
-        for row in ordered_conslist:
-            row_cells = table.add_row().cells
-            row_cells[0].text = str(row.text)
-            row_cells[1].text = str(row.orientation)
-            row_cells[2].text = str(row.score)
-            if float(row.score) < 0 or float(row.score) > 0:
-                hexcolor = get_heatmap_color(row.score, min_neg, max_pos, row.orientation)
-                if hexcolor:
-                    for cell in row_cells:
-                        cell._tc.get_or_add_tcPr().append(
-                            parse_xml(r'<w:shd {} w:fill="{}"/>'.format(nsdecls('w'), hexcolor))
-                        )
-        style_table(table)
-
+        zeros = [c for c in conslist if (float(c.score) == 0 if c.score is not None else False)
+                                      and c.type not in {"negative", "avoidance", "positive"}]
+        ordered_conslist = all_cons_sorted + zeros
+    
+        add_considerations_table(docasm, ordered_conslist, min_neg, max_pos)
+    
     # --- General considerations as usual ---
     docasm.add_heading("General Considerations (Not Tied to a Single Option)", level=2)
-    general_cons_short = [c for c in general_cons if getattr(c, 'field_id', None) in ALLOWED_FIELD_IDS]
-    general_cons_short = dedupe_considerations(general_cons_short)
+    general_cons_short = dedupe_considerations(general_cons, similarity_cutoff=0.95)
     if general_cons_short:
-        negatives = sorted(
-            [c for c in general_cons_short if c.orientation == "negative" and float(c.score) < 0],
-            key=lambda x: (float(x.score), str(x.text).lower())
+        all_general = [c for c in general_cons_short if c.type in {"negative", "avoidance", "positive"}]
+        all_general_sorted = sorted(
+            all_general,
+            key=lambda c: (float(c.score) if c.score is not None else 0, str(c.text).lower())
         )
-        zeros = sorted(
-            [c for c in general_cons_short if float(c.score) == 0],
-            key=lambda x: str(x.text).lower()
-        )
-        positives = sorted(
-            [c for c in general_cons_short if c.orientation == "positive" and float(c.score) > 0],
-            key=lambda x: (float(x.score), str(x.text).lower())
-        )
-        ordered_general = negatives + zeros + positives
-
-        table = docasm.add_table(rows=1, cols=3)
-        hdr_cells = table.rows[0].cells
-        hdr_cells[0].text = 'Consideration'
-        hdr_cells[1].text = 'Positive/Negative'
-        hdr_cells[2].text = 'Score'
-
-        for row in ordered_general:
-            row_cells = table.add_row().cells
-            row_cells[0].text = str(row.text)
-            row_cells[1].text = str(row.orientation)
-            row_cells[2].text = str(row.score)
-            if float(row.score) < 0 or float(row.score) > 0:
-                hexcolor = get_heatmap_color(row.score, min_neg, max_pos, row.orientation)
-                if hexcolor:
-                    for cell in row_cells:
-                        cell._tc.get_or_add_tcPr().append(
-                            parse_xml(r'<w:shd {} w:fill="{}"/>'.format(nsdecls('w'), hexcolor))
-                        )
-        style_table(table)
+        zeros = [c for c in general_cons_short if (float(c.score) == 0 if c.score is not None else False)
+                                           and c.type not in {"negative", "avoidance", "positive"}]
+        ordered_general = all_general_sorted + zeros
+        add_considerations_table(docasm, ordered_general, min_neg, max_pos)
     else:
         docasm.add_paragraph("No general considerations were raised.")
+
 
     # ==== Chapter 2: Summaries and Conclusions ====
     docasm.add_page_break()
