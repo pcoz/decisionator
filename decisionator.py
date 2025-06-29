@@ -34,67 +34,54 @@ import openai
 import sys
 import re
 import time
-from typing import Dict, List, Any, Optional, Tuple, Callable
+from typing import Dict, List, Any, Optional, Tuple, Callable, Union
 from dataclasses import dataclass, asdict, field
+
+from collections import defaultdict, Counter
+from difflib import SequenceMatcher
 
 from enum import Enum
 import numpy as np
 
 from docx import Document
-from docx.shared import Pt
+from docx.shared import Pt, RGBColor
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml import parse_xml
 from docx.oxml.ns import nsdecls
 
+import markdown
+
 import logging
 import datetime
+import itertools
+
+from docx.shared import Inches
+
+##Detect debug mode
+import argparse
+
+DEBUG_MODE = False
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args, unknown = parser.parse_known_args()
+    DEBUG_MODE = args.debug
+
 
 ####################################################################################################
 # Helper functions for Markdown and Word document operations
 ####################################################################################################
-def add_markdown_to_doc(doc, markdown_text):
-    '''
-    Converts Markdown text into formatted Word document content.
-    Handles code blocks, headings, bolding, and regular paragraphs.
-    Used for adding summaries and explanations with preserved formatting.
-    '''
-    lines = re.sub(r'\n\s*\n+', '\n', markdown_text.strip()).split('\n')
-    in_code_block = False
-    for line in lines:
-        if line.strip().startswith('```'):
-            in_code_block = not in_code_block
-            continue
-        if in_code_block:
-            run = doc.add_paragraph().add_run(line)
-            run.font.name = 'Courier New'
-            run.font.size = Pt(10)
-        else:
-            # Handle basic markdown heading
-            if line.startswith('### '):
-                doc.add_heading(line[4:], level=4)
-            elif line.startswith('## '):
-                doc.add_heading(line[3:], level=3)
-            elif line.startswith('# '):
-                doc.add_heading(line[2:], level=2)
-            elif '**' in line:
-                p = doc.add_paragraph()
-                parts = line.split('**')
-                for j, part in enumerate(parts):
-                    if j % 2 == 1:
-                        p.add_run(part).bold = True
-                    else:
-                        p.add_run(part)
-            else:
-                doc.add_paragraph(line)
-
 def is_markdown(text):
     '''
     Detects if the supplied text includes Markdown formatting cues.
     Returns True if so, else False.
     '''
     return any(s in text for s in ('# ', '## ', '### ', '**', '`', '* '))
+
+
 
 class DocAssembler:
     '''
@@ -109,6 +96,31 @@ class DocAssembler:
         self.doc.add_paragraph("Generated using TA Models and OpenAI.")
         self.doc.add_paragraph()
     
+    def _add_markdown_to_doc(self, markdown_text):
+        """
+        Entry point for adding markdown text to the document. Splits the markdown
+        into logical blocks and processes each.
+        """
+        text = self._normalize_text(markdown_text)
+        blocks = self._split_into_blocks(text)
+        for block in blocks:
+            self._parse_block(block)
+
+    def add_markdown_to_cell(self, cell, markdown_text):
+        """
+        Renders markdown-formatted text into a Word table cell.
+        Supports bullets, bold, italics, etc., using the main markdown parsing logic.
+        """
+        # Use your main markdown splitting/parsing logic here:
+        blocks = self._split_into_blocks(self._normalize_text(markdown_text))
+        for block in blocks:
+            if block['type'] == 'list':
+                self._parse_list(block['content'], paragraph=None, container=cell)
+            else:
+                p = cell.add_paragraph()
+                self._parse_inline_formatting(p, block['content'])
+    
+
     def set_section(self, section_name):
         self.section = section_name
     
@@ -132,41 +144,474 @@ class DocAssembler:
     
     def get_doc(self):
         return self.doc
-
-    def _add_markdown_to_doc(self, markdown_text):
-        # This is a direct move of your original function, but using self.doc
-        lines = re.sub(r'\n\s*\n+', '\n', markdown_text.strip()).split('\n')
+    
+    def _normalize_text(self, text):
+        """Normalize text by handling different line endings and excessive whitespace."""
+        # Convert different line endings to \n
+        text = re.sub(r'\r\n|\r', '\n', text)
+        
+        # Remove trailing whitespace from lines
+        lines = [line.rstrip() for line in text.split('\n')]
+        
+        return '\n'.join(lines)
+    
+    def _split_into_blocks(self, text):
+        """Split text into logical blocks (paragraphs, code blocks, lists, etc.)."""
+        blocks = []
+        lines = text.split('\n')
+        current_block = []
         in_code_block = False
-        for line in lines:
-            if line.strip().startswith('```'):
-                in_code_block = not in_code_block
-                continue
-            if in_code_block:
-                run = self.doc.add_paragraph().add_run(line)
-                run.font.name = 'Courier New'
-                run.font.size = Pt(10)
-            else:
-                if line.startswith('### '):
-                    self.doc.add_heading(line[4:], level=4)
-                elif line.startswith('## '):
-                    self.doc.add_heading(line[3:], level=3)
-                elif line.startswith('# '):
-                    self.doc.add_heading(line[2:], level=2)
-                elif '**' in line:
-                    p = self.doc.add_paragraph()
-                    parts = line.split('**')
-                    for j, part in enumerate(parts):
-                        if j % 2 == 1:
-                            p.add_run(part).bold = True
-                        else:
-                            p.add_run(part)
+        code_block_lang = None
+        in_table = False
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            
+            # Handle code blocks
+            if stripped.startswith('```'):
+                if in_code_block:
+                    # End of code block
+                    current_block.append(line)
+                    blocks.append({
+                        'type': 'code_block',
+                        'content': '\n'.join(current_block),
+                        'language': code_block_lang
+                    })
+                    current_block = []
+                    in_code_block = False
+                    code_block_lang = None
                 else:
-                    self.doc.add_paragraph(line)
-
-from docx.shared import Inches
-from docx.oxml.ns import qn
-from docx.oxml import parse_xml
-from docx.oxml.ns import nsdecls
+                    # Start of code block
+                    if current_block:
+                        blocks.append({'type': 'paragraph', 'content': '\n'.join(current_block)})
+                        current_block = []
+                    
+                    code_block_lang = stripped[3:].strip() if len(stripped) > 3 else None
+                    current_block.append(line)
+                    in_code_block = True
+                i += 1
+                continue
+            
+            if in_code_block:
+                current_block.append(line)
+                i += 1
+                continue
+            
+            # Handle tables
+            if '|' in stripped and stripped.count('|') >= 2:
+                if not in_table:
+                    if current_block:
+                        blocks.append({'type': 'paragraph', 'content': '\n'.join(current_block)})
+                        current_block = []
+                    in_table = True
+                current_block.append(line)
+            elif in_table and stripped == '':
+                # End of table
+                blocks.append({'type': 'table', 'content': '\n'.join(current_block)})
+                current_block = []
+                in_table = False
+            elif in_table:
+                # End of table due to non-table content
+                blocks.append({'type': 'table', 'content': '\n'.join(current_block)})
+                current_block = [line]
+                in_table = False
+            
+            # Handle lists
+            elif self._is_list_item(stripped):
+                if current_block and not self._is_list_item(current_block[-1].strip()):
+                    blocks.append({'type': 'paragraph', 'content': '\n'.join(current_block)})
+                    current_block = []
+                current_block.append(line)
+            
+            # Handle headers
+            elif stripped.startswith('#'):
+                if current_block:
+                    blocks.append(self._determine_block_type('\n'.join(current_block)))
+                    current_block = []
+                blocks.append({'type': 'header', 'content': line})
+            
+            # Handle horizontal rules
+            elif re.match(r'^[-*_]{3,}$', stripped):
+                if current_block:
+                    blocks.append(self._determine_block_type('\n'.join(current_block)))
+                    current_block = []
+                blocks.append({'type': 'hr', 'content': line})
+            
+            # Handle blockquotes
+            elif stripped.startswith('>'):
+                if current_block and not current_block[-1].strip().startswith('>'):
+                    blocks.append(self._determine_block_type('\n'.join(current_block)))
+                    current_block = []
+                current_block.append(line)
+            
+            # Handle empty lines
+            elif stripped == '':
+                if current_block:
+                    blocks.append(self._determine_block_type('\n'.join(current_block)))
+                    current_block = []
+            
+            # Regular content
+            else:
+                current_block.append(line)
+            
+            i += 1
+        
+        # Handle remaining content
+        if current_block:
+            if in_table:
+                blocks.append({'type': 'table', 'content': '\n'.join(current_block)})
+            else:
+                blocks.append(self._determine_block_type('\n'.join(current_block)))
+        
+        return blocks
+    
+    def _determine_block_type(self, content):
+        """Determine the type of a content block."""
+        stripped = content.strip()
+        
+        if self._is_list_block(content):
+            return {'type': 'list', 'content': content}
+        elif stripped.startswith('>'):
+            return {'type': 'blockquote', 'content': content}
+        else:
+            return {'type': 'paragraph', 'content': content}
+    
+    def _is_list_item(self, line):
+        """Check if a line is a list item."""
+        # Unordered list patterns (including non-standard bullets)
+        if re.match(r'^\s*[-*+·•‣⁃]\s+', line):
+            return True
+        # Ordered list patterns
+        if re.match(r'^\s*\d+\.\s+', line):
+            return True
+        return False
+    
+    def _is_list_block(self, content):
+        """Check if content block contains list items."""
+        lines = content.split('\n')
+        list_lines = sum(1 for line in lines if self._is_list_item(line.strip()))
+        return list_lines > 0
+    
+    def _get_list_indent_level(self, line):
+        """Calculate the indentation level of a list item."""
+        # Count leading spaces/tabs before the list marker
+        leading_spaces = len(line) - len(line.lstrip())
+        # Convert tabs to spaces (assuming 4 spaces per tab)
+        line_with_spaces = line.expandtabs(4)
+        leading_spaces_normalized = len(line_with_spaces) - len(line_with_spaces.lstrip())
+        
+        # Each indentation level is typically 2 or 4 spaces
+        # We'll use 2 spaces as the base unit
+        return leading_spaces_normalized // 2
+    
+    def _parse_block(self, block):
+        """Parse a single block based on its type."""
+        block_type = block.get('type', 'paragraph')
+        content = block.get('content', '')
+        
+        try:
+            if block_type == 'header':
+                self._parse_header(content)
+            elif block_type == 'code_block':
+                self._parse_code_block(content, block.get('language'))
+            elif block_type == 'list':
+                self._parse_list(content)
+            elif block_type == 'table':
+                self._parse_table(content)
+            elif block_type == 'blockquote':
+                self._parse_blockquote(content)
+            elif block_type == 'hr':
+                self._add_horizontal_rule()
+            else:
+                self._parse_paragraph(content)
+        except Exception as e:
+            logging.warning(f"Error parsing block type {block_type}: {str(e)}")
+            # Fallback to plain paragraph
+            self.doc.add_paragraph(content)
+    
+    def _parse_header(self, line):
+        """Parse header line and add to document."""
+        stripped = line.strip()
+        if not stripped.startswith('#'):
+            return
+        
+        # Count hash symbols
+        level = 0
+        for char in stripped:
+            if char == '#':
+                level += 1
+            else:
+                break
+        
+        # Limit to valid heading levels (1-6)
+        level = min(max(level, 1), 6)
+        
+        # Extract header text
+        header_text = stripped[level:].strip()
+        
+        if header_text:
+            self.doc.add_heading(header_text, level=level)
+    
+    def _parse_code_block(self, content, language=None):
+        """Parse code block and add to document."""
+        lines = content.split('\n')
+        
+        # Remove opening and closing ```
+        if lines and lines[0].strip().startswith('```'):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == '```':
+            lines = lines[:-1]
+        
+        # Add code paragraph
+        for line in lines:
+            p = self.doc.add_paragraph()
+            run = p.add_run(line)
+            run.font.name = 'Courier New'
+            run.font.size = Pt(10)
+            
+            # Add light background for code blocks
+            try:
+                run.font.color.rgb = RGBColor(51, 51, 51)  # Dark gray text
+            except:
+                pass  # Ignore if color setting fails
+    
+    def _parse_list(self, content):
+        """Parse list content and add to document with proper nesting support."""
+        lines = content.split('\n')
+        
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or not self._is_list_item(stripped):
+                continue
+            
+            # Calculate indentation level
+            indent_level = self._get_list_indent_level(line)
+            
+            # Extract list item text and determine list type
+            if re.match(r'^\s*[-*+·•‣⁃]\s+', line):
+                # Unordered list
+                text = re.sub(r'^\s*[-*+·•‣⁃]\s+', '', line).strip()
+                list_type = 'bullet'
+            elif re.match(r'^\s*\d+\.\s+', line):
+                # Ordered list
+                text = re.sub(r'^\s*\d+\.\s+', '', line).strip()
+                list_type = 'number'
+            else:
+                continue
+            
+            # Create paragraph with appropriate list style and indentation
+            if list_type == 'bullet':
+                if indent_level == 0:
+                    p = self.doc.add_paragraph(style='List Bullet')
+                elif indent_level == 1:
+                    p = self.doc.add_paragraph(style='List Bullet 2')
+                elif indent_level == 2:
+                    p = self.doc.add_paragraph(style='List Bullet 3')
+                else:
+                    # For deeper nesting, use List Bullet 3 with additional left indent
+                    p = self.doc.add_paragraph(style='List Bullet 3')
+                    # Add extra indentation for very deep nesting
+                    p.paragraph_format.left_indent = Inches(0.5 * (indent_level - 2))
+            else:  # numbered list
+                if indent_level == 0:
+                    p = self.doc.add_paragraph(style='List Number')
+                elif indent_level == 1:
+                    p = self.doc.add_paragraph(style='List Number 2')
+                elif indent_level == 2:
+                    p = self.doc.add_paragraph(style='List Number 3')
+                else:
+                    # For deeper nesting, use List Number 3 with additional left indent
+                    p = self.doc.add_paragraph(style='List Number 3')
+                    # Add extra indentation for very deep nesting
+                    p.paragraph_format.left_indent = Inches(0.5 * (indent_level - 2))
+            
+            # Clear any existing content in the paragraph
+            p.clear()
+            
+            # Parse inline formatting including bold text at the beginning
+            self._parse_inline_formatting(p, text)
+    
+    def _parse_table(self, content):
+        """Parse table content and add to document."""
+        lines = [line for line in content.split('\n') if line.strip()]
+        if not lines:
+            return
+        
+        # Filter out separator lines (lines with only |, -, and spaces)
+        table_lines = []
+        for line in lines:
+            if not re.match(r'^\s*\|[\s\-\|]*\|\s*$', line):
+                table_lines.append(line)
+        
+        if not table_lines:
+            return
+        
+        # Parse first row to determine column count
+        first_row = table_lines[0]
+        cells = [cell.strip() for cell in first_row.split('|')]
+        cells = [cell for cell in cells if cell]  # Remove empty cells from split
+        
+        if len(cells) < 2:
+            # Not a valid table, treat as paragraph
+            self._parse_paragraph(content)
+            return
+        
+        # Create table
+        table = self.doc.add_table(rows=len(table_lines), cols=len(cells))
+        table.style = 'Table Grid'
+        
+        # Fill table
+        for row_idx, line in enumerate(table_lines):
+            cells_data = [cell.strip() for cell in line.split('|')]
+            cells_data = [cell for cell in cells_data if cell]  # Remove empty
+            
+            for col_idx, cell_data in enumerate(cells_data):
+                if col_idx < len(table.rows[row_idx].cells):
+                    cell = table.rows[row_idx].cells[col_idx]
+                    # Parse inline formatting in cell
+                    self._parse_inline_formatting(cell.paragraphs[0], cell_data)
+    
+    def _parse_blockquote(self, content):
+        """Parse blockquote content and add to document."""
+        lines = content.split('\n')
+        quote_text = []
+        
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('>'):
+                quote_text.append(stripped[1:].strip())
+            elif stripped == '':
+                quote_text.append('')
+            else:
+                quote_text.append(stripped)
+        
+        # Add blockquote paragraph
+        p = self.doc.add_paragraph()
+        p.style = 'Quote'
+        self._parse_inline_formatting(p, '\n'.join(quote_text))
+    
+    def _parse_paragraph(self, content):
+        """Parse regular paragraph content."""
+        if not content.strip():
+            return
+        
+        lines = content.split('\n')
+        for line in lines:
+            if line.strip():
+                p = self.doc.add_paragraph()
+                self._parse_inline_formatting(p, line)
+    
+    def _parse_inline_formatting(self, paragraph, text):
+        """Parse inline formatting like bold, italic, code, links."""
+        if not text.strip():
+            return
+        
+        # Handle various inline patterns with improved bold detection
+        patterns = [
+            (r'\*\*\*(.*?)\*\*\*', 'bold_italic'),  # Bold italic
+            (r'\*\*(.*?)\*\*', 'bold'),             # Bold
+            (r'\*(.*?)\*', 'italic'),               # Italic
+            (r'~~(.*?)~~', 'strikethrough'),        # Strikethrough
+            (r'`([^`]+)`', 'code'),                 # Inline code
+            (r'\[([^\]]+)\]\(([^)]+)\)', 'link'),   # Links
+        ]
+        
+        # Split text by patterns while preserving the matches
+        parts = [text]
+        format_info = [None]
+        
+        for pattern, format_type in patterns:
+            new_parts = []
+            new_format_info = []
+            
+            for i, part in enumerate(parts):
+                if format_info[i] is not None:
+                    # Already formatted, don't process further
+                    new_parts.append(part)
+                    new_format_info.append(format_info[i])
+                    continue
+                
+                matches = list(re.finditer(pattern, part))
+                if not matches:
+                    new_parts.append(part)
+                    new_format_info.append(None)
+                    continue
+                
+                last_end = 0
+                for match in matches:
+                    # Add text before match
+                    if match.start() > last_end:
+                        new_parts.append(part[last_end:match.start()])
+                        new_format_info.append(None)
+                    
+                    # Add formatted text
+                    if format_type == 'link':
+                        new_parts.append((match.group(1), match.group(2)))
+                        new_format_info.append('link')
+                    else:
+                        new_parts.append(match.group(1))
+                        new_format_info.append(format_type)
+                    
+                    last_end = match.end()
+                
+                # Add remaining text
+                if last_end < len(part):
+                    new_parts.append(part[last_end:])
+                    new_format_info.append(None)
+            
+            parts = new_parts
+            format_info = new_format_info
+        
+        # Add formatted runs to paragraph
+        for part, fmt in zip(parts, format_info):
+            if not part:
+                continue
+            
+            if fmt == 'link':
+                # Handle links
+                text_part, url = part
+                run = paragraph.add_run(text_part)
+                try:
+                    # Add hyperlink (requires more complex XML manipulation)
+                    self._add_hyperlink(paragraph, run, url, text_part)
+                except:
+                    # Fallback: just add the text
+                    run.font.color.rgb = RGBColor(0, 0, 255)  # Blue color
+            else:
+                run = paragraph.add_run(str(part))
+                
+                # Apply formatting
+                if fmt == 'bold':
+                    run.bold = True
+                elif fmt == 'italic':
+                    run.italic = True
+                elif fmt == 'bold_italic':
+                    run.bold = True
+                    run.italic = True
+                elif fmt == 'strikethrough':
+                    run.font.strike = True
+                elif fmt == 'code':
+                    run.font.name = 'Courier New'
+                    run.font.size = Pt(10)
+                    try:
+                        run.font.color.rgb = RGBColor(199, 37, 78)  # Red color for code
+                    except:
+                        pass
+    
+    def _add_hyperlink(self, paragraph, run, url, text):
+        """Add hyperlink to paragraph (simplified version)."""
+        # This is a simplified version - full hyperlink support requires more complex XML
+        run.font.color.rgb = RGBColor(0, 0, 255)  # Blue color
+        run.underline = True
+    
+    def _add_horizontal_rule(self):
+        """Add horizontal rule to document."""
+        p = self.doc.add_paragraph()
+        p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        run = p.add_run('─' * 50)
+        run.font.color.rgb = RGBColor(128, 128, 128)  # Gray color
 
 def style_table(table):
     """
@@ -234,74 +679,6 @@ def style_table(table):
 
 from docx.oxml.ns import qn, nsdecls
 from docx.oxml import parse_xml
-
-def add_considerations_table(docasm, considerations, min_neg, max_pos):
-    """
-    Adds a formatted consideration table. No header repetition, no row-breaking tricks.
-    Ensures borders are preserved when applying heatmap colors.
-    """
-    table = docasm.add_table(rows=1, cols=3)
-    hdr_cells = table.rows[0].cells
-    hdr_cells[0].text = 'Consideration'
-    hdr_cells[1].text = 'Type'
-    hdr_cells[2].text = 'Score'
-    
-    # Apply initial styling (including borders)
-    style_table(table)
-    
-    for row in considerations:
-        row_cells = table.add_row().cells
-        row_cells[0].text = str(row.text)
-        row_cells[1].text = str(row.type)
-        row_cells[2].text = str(row.score)
-        
-        # Apply heatmap coloring while preserving borders
-        if row.score is not None and (float(row.score) < 0 or float(row.score) > 0):
-            hexcolor = get_heatmap_color(row.score, min_neg, max_pos, row.type)
-            if hexcolor:
-                for cell in row_cells:
-                    tc = cell._tc
-                    tcPr = tc.get_or_add_tcPr()
-                    
-                    # Add shading
-                    shading_xml = f'<w:shd {nsdecls("w")} w:fill="{hexcolor}"/>'
-                    tcPr.append(parse_xml(shading_xml))
-                    
-                    # Re-apply borders after shading to ensure they're not overridden
-                    borders_xml = f'''
-                    <w:tcBorders {nsdecls('w')}>
-                        <w:top w:val="single" w:sz="4" w:space="0" w:color="000000"/>
-                        <w:left w:val="single" w:sz="4" w:space="0" w:color="000000"/>
-                        <w:bottom w:val="single" w:sz="4" w:space="0" w:color="000000"/>
-                        <w:right w:val="single" w:sz="4" w:space="0" w:color="000000"/>
-                    </w:tcBorders>'''
-                    
-                    # Remove existing borders first
-                    for existing_borders in tcPr.xpath('.//w:tcBorders'):
-                        tcPr.remove(existing_borders)
-                    
-                    # Add fresh borders
-                    tcPr.append(parse_xml(borders_xml.strip()))
-        else:
-            # Even for non-colored cells, ensure borders are applied
-            for cell in row_cells:
-                tc = cell._tc
-                tcPr = tc.get_or_add_tcPr()
-                
-                borders_xml = f'''
-                <w:tcBorders {nsdecls('w')}>
-                    <w:top w:val="single" w:sz="4" w:space="0" w:color="000000"/>
-                    <w:left w:val="single" w:sz="4" w:space="0" w:color="000000"/>
-                    <w:bottom w:val="single" w:sz="4" w:space="0" w:color="000000"/>
-                    <w:right w:val="single" w:sz="4" w:space="0" w:color="000000"/>
-                </w:tcBorders>'''
-                
-                # Remove existing borders first
-                for existing_borders in tcPr.xpath('.//w:tcBorders'):
-                    tcPr.remove(existing_borders)
-                
-                # Add fresh borders
-                tcPr.append(parse_xml(borders_xml.strip()))
 
 def get_heatmap_color(score, min_neg, max_pos, type_):
     '''
@@ -373,6 +750,29 @@ def sort_considerations(conslist, negative=True):
 # Increase the value of similarity_cutoff (in increments of 0.01) to increase the number of deduped considerations.
 from difflib import SequenceMatcher
 
+
+def signed_score(type_, score):
+    '''
+    Ensures negative considerations have negative scores and positive/avoidance ones have positive.
+    Used to enforce type-appropriate sign in all tables.
+    '''
+    try:
+        val = float(score)
+    except Exception:
+        val = 0.0
+    # Treat 'avoidance' as 'positive'
+    orientation = type_
+    if type_ == "avoidance":
+        orientation = "positive"
+    if orientation == "negative" and val > 0:
+        return -val
+    if orientation == "positive" and val < 0:
+        return abs(val)
+    return val
+
+####################################################################################################
+# Helper Functions: Group & Amalgamate
+####################################################################################################
 def dedupe_considerations(conslist, similarity_cutoff=0.95):
     '''
     Deduplicate a list of Consideration objects, both by exact text and near-match (fuzzy).
@@ -399,24 +799,624 @@ def dedupe_considerations(conslist, similarity_cutoff=0.95):
             seen.add(text.lower())
     return deduped
 
-def signed_score(type_, score):
-    '''
-    Ensures negative considerations have negative scores and positive/avoidance ones have positive.
-    Used to enforce type-appropriate sign in all tables.
-    '''
+##**Code for merging considerations**
+class ConsiderationType(Enum):
+    POSITIVE = "positive"
+    NEGATIVE = "negative" 
+    AVOIDANCE = "avoidance"
+
+@dataclass
+class MergedConsideration:
+    """Data class for merged consideration results"""
+    merged_text: str
+    type: str
+    score: float
+    originals: List[Any]
+    confidence: float = 1.0
+    merge_method: str = "single"
+
+##**
+import uuid
+import logging
+from collections import defaultdict, Counter
+from typing import List, Any, Dict, Optional
+
+def merge_considerations_conceptually(
+    conslist: List[Any], 
+    controller: Any, 
+    context_prompt: str = "",
+    similarity_threshold: float = 0.8,  # Kept for legacy compatibility; ignored here
+    max_group_size: int = 10,           # Kept for legacy compatibility; ignored here
+    enable_semantic_grouping: bool = True,  # Kept for legacy compatibility; ignored here
+    fallback_on_api_failure: bool = True,
+    logger: Optional[logging.Logger] = None
+) -> List[Dict[str, Any]]:
+    """
+    Iteratively merges considerations using the AI, always giving the AI the full current set.
+    At each iteration, the AI can merge any (possibly overlapping) subset, returning:
+      - Which IDs were merged,
+      - The merged text.
+    This continues until the AI says 'NO_MERGE'.
+    All unmerged items are included as singles.
+
+    Returns:
+        List of merged consideration dicts, each with:
+            merged_text, type, score, originals, confidence, merge_method, merged_ids
+    """
+    if not conslist:
+        return []
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
+    print(f"\n🚀 STARTING CONSIDERATION CONSOLIDATION (Iterative AI, ID-driven)")
+    logger.info(f"Processing {len(conslist)} considerations (AI iterative merging)")
+
+    # ========== STEP 1: Validation & Bucketing ==========
+    valid_types = {t.value for t in ConsiderationType}
+    buckets = defaultdict(list)
+    invalid_items = []
+
+    # Attach a unique string ID to each consideration for AI tracking
+    for i, consideration in enumerate(conslist):
+        # Validate fields
+        if not hasattr(consideration, 'text') or not hasattr(consideration, 'type'):
+            logger.warning(f"Item {i} missing required attributes (text/type)")
+            invalid_items.append(i)
+            continue
+        ctype = str(consideration.type).lower().strip()
+        if ctype not in valid_types:
+            logger.warning(f"Item {i} has invalid type '{ctype}', skipping")
+            invalid_items.append(i)
+            continue
+        score = None
+        try:
+            score = float(getattr(consideration, 'score', 0.0))
+        except Exception:
+            score = 0.0
+        text = str(consideration.text).strip()
+        if not text:
+            logger.warning(f"Item {i} has empty text, skipping")
+            invalid_items.append(i)
+            continue
+
+        # Unique ID for tracking through the AI merge process
+        if not hasattr(consideration, 'merge_id'):
+            consideration.merge_id = str(uuid.uuid4())
+        score_sign = "positive" if score >= 0 else "negative"
+        bucket_key = (ctype, score_sign)
+        # Attach index for error tracking
+        consideration._original_index = i
+        buckets[bucket_key].append(consideration)
+
+    if invalid_items:
+        print(f"⚠️ VALIDATION: Skipped {len(invalid_items)} invalid items (indices: {invalid_items})")
+        logger.info(f"Skipped {len(invalid_items)} invalid items")
+
+    if not buckets:
+        print("❌ ERROR: No valid considerations found after validation")
+        logger.warning("No valid considerations found after validation")
+        return []
+
+    print(f"📦 BUCKETING: Created {len(buckets)} type-based buckets")
+    for (ctype, score_sign), bucket in buckets.items():
+        print(f"   {ctype} ({score_sign}): {len(bucket)} items")
+    logger.info(f"Created {len(buckets)} buckets for processing")
+
+    # ========== STEP 2: AI-based Iterative Merging ==========
+
+    merged_groups = []
+    for (ctype, score_sign), bucket in buckets.items():
+        print(f"\n🔍 PROCESSING BUCKET: {ctype} ({score_sign}) - {len(bucket)} items")
+        logger.info(f"Processing bucket ({ctype}, {score_sign}) with {len(bucket)} items")
+
+        # Maintain a working set for this bucket
+        working = list(bucket)  # These are the "active" (unmerged) considerations for this bucket
+        already_merged_ids = set()
+        round_count = 0
+
+        while len(working) > 1:
+            round_count += 1
+            # Build prompt for this merge round
+            ai_prompt = _build_iterative_merge_prompt(
+                working,
+                context_prompt=context_prompt,
+                bucket_type=ctype,
+                bucket_score_sign=score_sign,
+                logger=logger,
+                round_number=round_count
+            )
+            logger.info(f"AI Merge Prompt (Round {round_count}):\n{ai_prompt}")
+
+            try:
+                ai_response = controller._call_openai_api(ai_prompt)
+            except Exception as e:
+                logger.error(f"AI merge call failed in round {round_count}: {e}")
+                if fallback_on_api_failure:
+                    break
+                else:
+                    raise
+
+            # Parse AI response for merge instruction
+            try:
+                merge_instruction = _parse_ai_merge_response(ai_response, logger)
+            except Exception as e:
+                logger.error(f"Failed to parse AI response in round {round_count}: {e}")
+                if fallback_on_api_failure:
+                    break
+                else:
+                    raise
+
+            # If NO_MERGE: exit loop, we're done with this bucket
+            if merge_instruction.get("NO_MERGE", False):
+                print(f"   ✅ AI indicated no further merges possible in round {round_count}.")
+                break
+
+            ids_to_merge = set(merge_instruction.get("ids", []))
+            merged_text = merge_instruction.get("merged_text", "").strip()
+            if not ids_to_merge or not merged_text:
+                logger.warning(f"AI merge result incomplete or invalid (round {round_count}), skipping further merges.")
+                break
+
+            group_items = [item for item in working if getattr(item, "merge_id", None) in ids_to_merge]
+            if not group_items:
+                logger.warning(f"AI merge IDs did not match any current considerations in round {round_count}. Skipping merge.")
+                break
+
+            # Calculate average score, type majority, and originals for this merge
+            avg_score = sum(float(getattr(item, "score", 0.0)) for item in group_items) / len(group_items)
+            type_majority = Counter([str(getattr(item, "type", ctype)).lower().strip() for item in group_items]).most_common(1)[0][0]
+            originals = [getattr(item, "original", item) for item in group_items]
+            confidence = 0.95  # arbitrary, as AI merged
+
+            # Add merged result to output
+            merged_groups.append({
+                "merged_text": merged_text,
+                "type": type_majority,
+                "score": avg_score,
+                "originals": originals,
+                "confidence": confidence,
+                "merge_method": "ai_iterative",
+                "merged_ids": list(ids_to_merge),
+                "consolidation_count": len(group_items)
+            })
+            print(f"   🔄 CONSOLIDATED [{round_count}]: {len(group_items)} items → 1 by AI (IDs: {', '.join(ids_to_merge)})")
+            logger.info(f"AI merged {len(group_items)} items (IDs: {ids_to_merge}) in round {round_count}")
+
+            # Remove merged items from working set
+            working = [item for item in working if getattr(item, "merge_id", None) not in ids_to_merge]
+            already_merged_ids.update(ids_to_merge)
+
+        # Add any remaining unmerged items as singles
+        for item in working:
+            merged_groups.append({
+                "merged_text": str(getattr(item, "text", "")),
+                "type": str(getattr(item, "type", ctype)),
+                "score": float(getattr(item, "score", 0.0)),
+                "originals": [getattr(item, "original", item)],
+                "confidence": 1.0,
+                "merge_method": "single",
+                "merged_ids": [getattr(item, "merge_id", None)],
+                "consolidation_count": 1
+            })
+
+    # ========== STEP 3: Final sorting, logging, reporting ==========
+
+    # Sort by score ascending, regardless of type
+    merged_groups = sorted(
+        merged_groups,
+        key=lambda g: float(g["score"])
+    )
+
+    # Logging and summary reporting as before
+    total_originals = sum(len(group.get('originals', [])) for group in merged_groups)
+    consolidations = [g for g in merged_groups if g.get('consolidation_count', 0) > 1]
+    singles = [g for g in merged_groups if g.get('consolidation_count', 0) == 1]
+
+    print(f"\n🎯 FINAL CONSOLIDATION RESULTS (Iterative AI):")
+    print("=" * 50)
+    print(f"📥 INPUT:  {len(conslist)} original considerations")
+    print(f"📤 OUTPUT: {len(merged_groups)} final groups")
+    print(f"🔄 CONSOLIDATED: {len(consolidations)} groups (representing {sum(g.get('consolidation_count', 0) for g in consolidations)} originals)")
+    print(f"✅ SINGLES: {len(singles)} individual considerations")
+    print(f"📊 REDUCTION: {((len(conslist) - len(merged_groups)) / len(conslist) * 100):.1f}% fewer items")
+    if consolidations:
+        print(f"\n🔍 CONSOLIDATION DETAILS:")
+        for i, group in enumerate(consolidations):
+            count = group.get('consolidation_count', 0)
+            method = group.get('merge_method', 'unknown')
+            ids = ', '.join(group.get('merged_ids', []))
+            print(f"   Group {i+1}: {count} items (IDs: {ids}) → 1 (method: {method})")
+    print("=" * 50)
+
+    logger.info(f"Merge summary: {len(conslist)} input, {len(merged_groups)} output, {len(consolidations)} consolidated.")
+
+    return merged_groups
+
+
+def _build_iterative_merge_prompt(considerations, context_prompt, bucket_type, bucket_score_sign, logger, round_number):
+    """
+    Build a prompt for the AI to merge considerations, presenting all as an explicit ID+text list.
+    """
+    cons_str = ""
+    for item in considerations:
+        cons_str += f"- ID: {getattr(item, 'merge_id', '?')}\n"
+        cons_str += f"  Type: {getattr(item, 'type', bucket_type)} | Score: {getattr(item, 'score', 0.0)}\n"
+        cons_str += f"  Text: {getattr(item, 'text', '').strip()}\n"
+    prompt = f'''
+You are a technical decision analysis assistant.
+Context: {context_prompt}
+
+This is a list of considerations of type '{bucket_type}' ({bucket_score_sign}). Each has a unique 'ID'.
+
+**Task:** For the list below, look for any two or more considerations that express the *same core idea or reasoning* (not just of the same type, but actually conceptually redundant or overlapping). If you find any such group, propose a single merged version as shown below.
+
+Respond in **valid JSON** as:
+
+{{
+  "ids": ["ID1", "ID2", ...],    // the IDs you are merging (must be from the list below)
+  "merged_text": "Merged text here, following best technical summary practices."
+}}
+
+**If, on this round, there are NO further mergeable groups, respond ONLY:**
+
+```json
+{{ "NO_MERGE": true }}
+```
+Here is the current list:
+{cons_str}
+'''
+    logger.info(f"AI prompt for iterative merge (round {round_number}): {prompt[:1000]}...[truncated]" if len(prompt) > 1000 else prompt)
+    return prompt
+
+
+def _parse_ai_merge_response(response, logger):
+    """
+    Parse the AI's JSON output (which may be surrounded by Markdown code fences).
+    """
+    import json
+    import re
+
+    # Remove Markdown fences if present
+    match = re.search(r'\{.*\}', response, re.DOTALL)
+    if not match:
+        # Try a less strict fallback
+        logger.warning(f"Could not find JSON object in AI response. Raw response: {response}")
+        if "NO_MERGE" in response:
+            return {"NO_MERGE": True}
+        raise ValueError("AI response did not contain a JSON object.")
+    response_json = match.group(0)
     try:
-        val = float(score)
-    except Exception:
-        val = 0.0
-    # Treat 'avoidance' as 'positive'
-    orientation = type_
-    if type_ == "avoidance":
-        orientation = "positive"
-    if orientation == "negative" and val > 0:
-        return -val
-    if orientation == "positive" and val < 0:
-        return abs(val)
-    return val
+        parsed = json.loads(response_json)
+        return parsed
+    except Exception as e:
+        logger.error(f"JSON parse failed: {e}\nRaw: {response_json}")
+        if "NO_MERGE" in response_json:
+            return {"NO_MERGE": True}
+        raise
+
+
+def _sort_merged_groups(groups: List[Dict[str, Any]], logger: logging.Logger) -> List[Dict[str, Any]]:
+    """Sort merged groups for optimal display order"""
+    
+    type_order = {"negative": 0, "avoidance": 1, "positive": 2}
+    
+    try:
+        sorted_groups = sorted(
+            groups, 
+            key=lambda g: (
+                type_order.get(g.get('type', 'unknown'), 99), 
+                float(g.get('score', 0))
+            )
+        )
+        return sorted_groups
+        
+    except Exception as e:
+        logger.error(f"Failed to sort groups: {e}")
+        return groups  # Return unsorted if sorting fails
+
+##**
+def _normalize_markdown_input(md: str, strip_html: bool, logger: logging.Logger) -> str:
+    """Normalize and clean markdown input."""
+    try:
+        # Basic cleanup
+        md_clean = md.strip()
+        
+        # Remove excessive whitespace
+        md_clean = re.sub(r'\n\s*\n\s*\n+', '\n\n', md_clean)
+        md_clean = re.sub(r'[ \t]+', ' ', md_clean)
+        
+        # Strip HTML tags if requested
+        if strip_html:
+            md_clean = re.sub(r'<[^>]+>', '', md_clean)
+            # Clean up HTML entities
+            html_entities = {
+                '&amp;': '&', '&lt;': '<', '&gt;': '>', 
+                '&quot;': '"', '&#39;': "'", '&nbsp;': ' '
+            }
+            for entity, char in html_entities.items():
+                md_clean = md_clean.replace(entity, char)
+        
+        # Remove markdown formatting that might interfere
+        #md_clean = re.sub(r'\*\*(.*?)\*\*', r'\1', md_clean)  # Bold
+        #md_clean = re.sub(r'\*(.*?)\*', r'\1', md_clean)      # Italic
+        #md_clean = re.sub(r'`(.*?)`', r'\1', md_clean)        # Inline code
+        
+        return md_clean
+        
+    except Exception as e:
+        logger.error(f"Failed to normalize markdown input: {e}")
+        return md.strip()  # Fallback to basic strip
+
+
+def _remove_code_block_markers(lines: List[str], logger: logging.Logger) -> List[str]:
+    """Remove code block markers from beginning and end."""
+    try:
+        if not lines:
+            return lines
+            
+        # Remove opening code block
+        if lines[0].strip().startswith('```'):
+            lines = lines[1:]
+            logger.debug("Removed opening code block marker")
+        
+        # Remove closing code block
+        if lines and lines[-1].strip().endswith('```'):
+            lines = lines[:-1]
+            logger.debug("Removed closing code block marker")
+            
+        # Handle nested or multiple code blocks
+        clean_lines = []
+        in_code_block = False
+        for line in lines:
+            if line.strip().startswith('```'):
+                in_code_block = not in_code_block
+                continue
+            if not in_code_block:
+                clean_lines.append(line)
+                
+        return clean_lines
+        
+    except Exception as e:
+        logger.warning(f"Error removing code block markers: {e}")
+        return lines
+
+
+def _find_bullet_start(lines: List[str]) -> Tuple[Optional[int], List[str]]:
+    """
+    Find the index of the first markdown bullet (of any recognized style),
+    skipping any blank lines or code blocks before the list.
+    - Handles code blocks, blank lines, and all standard and common Unicode bullets.
+    - Returns (index of first bullet, bullet_patterns).
+    """
+    bullet_patterns = [
+        r'^\s*[-•*+]\s+',           # Unordered (with optional indent)
+        r'^\s*\d+\.\s+',            # Numbered (1., 2., etc)
+        r'^\s*[a-zA-Z]\.\s+',       # Lettered (a., b., etc)
+        r'^\s*→\s+',                # Unicode arrow
+        r'^\s*▪\s+',                # Unicode square
+        r'^\s*◦\s+',                # Unicode circle
+        r'^\s*‣\s+',                # Unicode triangle bullet
+        r'^\s*·\s+',                # Unicode middle dot
+        r'^\s*⁃\s+',                # Unicode hyphen bullet
+        r'^\s*‣\s+',                # Unicode triangle
+        r'^\s*\(\d+\)\s+',          # (1), (2), ... styles
+        r'^\s*\([a-zA-Z]\)\s+',     # (a), (b), ... styles
+        r'^\s*—\s+',                # em dash
+        r'^\s*•\s+',                # Bullet (duplicate for clarity)
+    ]
+
+    code_fence_open = False
+    for i, line in enumerate(lines):
+        # Remove trailing newlines/spaces and expand tabs for consistency
+        line_expanded = line.expandtabs(4).rstrip('\n')
+        stripped = line_expanded.strip()
+        # Handle code blocks: never parse bullets inside
+        if stripped.startswith("```"):
+            code_fence_open = not code_fence_open
+            continue
+        if code_fence_open:
+            continue
+        # Skip blank lines
+        if not stripped:
+            continue
+        # See if the line is a bullet
+        for pattern in bullet_patterns:
+            if re.match(pattern, stripped):
+                return i, bullet_patterns
+    return None, bullet_patterns
+
+
+##Debug helper function
+def debug_process_specific_md_line(md_line, logger=None):
+    print("\n[DEBUG] Processing specific MD line:")
+    print(f"  RAW: {repr(md_line)}")
+
+    # Step 1: Normalization (as your markdown helpers do)
+    norm = md_line.expandtabs(4).rstrip('\n').strip()
+    print(f"  Normalized: {repr(norm)}")
+
+    # Step 2: Bullet detection (patterns as per your _find_bullet_start)
+    bullet_patterns = [
+        r'^\s*[-•*+]\s+', r'^\s*\d+\.\s+', r'^\s*[a-zA-Z]\.\s+',
+        r'^\s*→\s+', r'^\s*▪\s+', r'^\s*◦\s+', r'^\s*‣\s+',
+        r'^\s*·\s+', r'^\s*⁃\s+', r'^\s*—\s+', r'^\s*•\s+',
+        r'^\s*\(\d+\)\s+', r'^\s*\([a-zA-Z]\)\s+',
+    ]
+    matched = None
+    for pattern in bullet_patterns:
+        if re.match(pattern, norm):
+            matched = pattern
+            break
+    print(f"  Bullet pattern matched: {matched}")
+
+    # Step 3: Extract bullet content if matched
+    if matched:
+        match = re.match(matched, norm)
+        bullet_content = norm[match.end():].strip()
+        print(f"  Bullet content after marker: {repr(bullet_content)}")
+    else:
+        print("  No bullet pattern matched, treating as paragraph.")
+
+    # Step 4: Inline formatting detection (bold/italic)
+    # (Use your own parsing logic, here a quick scan)
+    bold = re.findall(r'\*\*(.+?)\*\*', norm)
+    italic = re.findall(r'\*(.+?)\*', norm)
+    print(f"  Detected bold: {bold}")
+    print(f"  Detected italic: {italic}")
+
+    # Optional: Show how this would be added to a docx cell
+    print("  Would be added as a bullet paragraph with parsed bold/italic in docx (if not in code block).")
+
+    print("[DEBUG] Finished processing specific MD line.\n")
+##
+
+def _process_intro_section(lines: List[str], strip_html: bool, logger: logging.Logger) -> str:
+    """Process introduction section before bullets."""
+    try:
+        if not lines:
+            return ""
+        
+        # Join lines and clean up
+        intro_parts = []
+        for line in lines:
+            line_clean = line.strip()
+            if line_clean:
+                intro_parts.append(line_clean)
+        
+        intro_text = ' '.join(intro_parts)
+        
+        # Additional cleanup for intro
+        intro_text = re.sub(r'\s+', ' ', intro_text)  # Normalize whitespace
+        intro_text = intro_text.strip()
+        
+        return intro_text
+        
+    except Exception as e:
+        logger.error(f"Error processing intro section: {e}")
+        return ""
+
+
+def _extract_bullets(
+    bullet_lines: List[str], 
+    bullet_patterns: List[str], 
+    max_length: int,
+    strip_html: bool,
+    logger: logging.Logger
+) -> List[str]:
+    """Extract and clean bullet points from lines."""
+    bullets = []
+    current_bullet = ""
+    
+    try:
+        for line in bullet_lines:
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            
+            # Check if this line starts a new bullet
+            is_new_bullet = False
+            bullet_text = ""
+            
+            for pattern in bullet_patterns:
+                match = re.match(pattern, line_stripped)
+                if match:
+                    # Save previous bullet if exists
+                    if current_bullet:
+                        bullets.append(current_bullet.strip())
+                    
+                    # Extract bullet content
+                    bullet_text = line_stripped[match.end():].strip()
+                    current_bullet = bullet_text
+                    is_new_bullet = True
+                    break
+            
+            # If not a new bullet, might be continuation of previous
+            if not is_new_bullet and current_bullet:
+                # Handle multi-line bullets
+                current_bullet += " " + line_stripped
+            elif not is_new_bullet and line_stripped:
+                # Standalone line that doesn't match bullet pattern
+                logger.warning(f"Non-bullet line in bullet section: {line_stripped[:50]}...")
+        
+        # Don't forget the last bullet
+        if current_bullet:
+            bullets.append(current_bullet.strip())
+        
+        # Clean and validate bullets
+        cleaned_bullets = []
+        for bullet in bullets:
+            bullet_clean = _clean_bullet_text(bullet, max_length, strip_html, logger)
+            if bullet_clean:
+                cleaned_bullets.append(bullet_clean)
+        
+        logger.debug(f"Extracted {len(cleaned_bullets)} bullets from {len(bullet_lines)} lines")
+        return cleaned_bullets
+        
+    except Exception as e:
+        logger.error(f"Error extracting bullets: {e}")
+        return []
+
+
+def _clean_bullet_text(bullet: str, max_length: int, strip_html: bool, logger: logging.Logger) -> str:
+    """Clean individual bullet text."""
+    try:
+        if not bullet or not bullet.strip():
+            return ""
+        
+        bullet_clean = bullet.strip()
+        
+        # Remove any remaining bullet markers that might have slipped through
+        bullet_clean = re.sub(r'^[-•*+▪◦→]\s*', '', bullet_clean)
+        bullet_clean = re.sub(r'^\d+\.\s*', '', bullet_clean)
+        bullet_clean = re.sub(r'^[a-zA-Z]\.\s*', '', bullet_clean)
+        
+        # Length validation
+        if len(bullet_clean) > max_length:
+            logger.warning(f"Bullet text truncated from {len(bullet_clean)} to {max_length} chars")
+            bullet_clean = bullet_clean[:max_length-3] + "..."
+        
+        # Final cleanup
+        bullet_clean = re.sub(r'\s+', ' ', bullet_clean)
+        bullet_clean = bullet_clean.strip()
+        
+        return bullet_clean
+        
+    except Exception as e:
+        logger.error(f"Error cleaning bullet text: {e}")
+        return bullet.strip() if bullet else ""
+
+
+def _add_paragraph_safely(cell, text: str, style: str = None, logger: logging.Logger = None) -> bool:
+    """Safely add paragraph to cell with error handling."""
+    try:
+        if not text or not text.strip():
+            return False
+        
+        if style:
+            cell.add_paragraph(text, style=style)
+        else:
+            cell.add_paragraph(text)
+        
+        return True
+        
+    except AttributeError as e:
+        if logger:
+            logger.error(f"Cell object missing add_paragraph method: {e}")
+        raise RuntimeError(f"Invalid cell object: {e}")
+    except Exception as e:
+        if logger:
+            logger.error(f"Failed to add paragraph to cell: {e}")
+        raise RuntimeError(f"Failed to add content to cell: {e}")
+
+####################################################################################################
+# API helper functions
+####################################################################################################
+def get_option_text(opt: dict) -> str:
+    """
+    Safely returns the text label for a decision option, handling both 'text' and 'description' keys.
+    Falls back to stringified dict if neither present.
+    """
+    return opt.get('text') or opt.get('description') or str(opt)
 
 ####################################################################################################
 # Logging and API Config
@@ -941,7 +1941,6 @@ Please summarise in clear, everyday language for a general audience.
             return data
         except Exception as e:
             # Try to fix unescaped control characters
-            import re
             def escape_control_chars(s):
                 # This escapes literal line breaks and tabs inside strings
                 def repl(m):
@@ -1018,14 +2017,14 @@ Please summarise in clear, everyday language for a general audience.
                 sys.exit(1)
             return json.dumps({"__error__": error_str})
 
-    def _execute_model1(self, problem: str, options, doc, considerations, log_callback=None) -> DecisionResult:
+    def _execute_model1(self, problem: str, options, filtered_pairs, doc, considerations, log_callback=None) -> DecisionResult:
         if log_callback:
             log_callback("start", {"model": "model1", "problem": problem})
         print("Executing Model 1: Democratic Ego State Council")
         ego_responses = []
         for ego_state in self.workflows[DecisionModel.DEMOCRATIC_COUNCIL]["ego_states"]:
             # Call API with the new prompt (returns a flat list of dicts)
-            response = self._call_openai_api(self._ego_state_prompt(problem, ego_state, options))
+            response = self._call_openai_api(self._ego_state_prompt(problem, ego_state, options, filtered_pairs))
             if log_callback:
                 log_callback("ego_response", {"ego_state": ego_state, "raw_response": response})
             if doc:
@@ -1115,13 +2114,13 @@ Please summarise in clear, everyday language for a general audience.
     
         return decision
 
-    def _execute_model2(self, problem: str, options, doc, considerations, log_callback=None) -> DecisionResult:
+    def _execute_model2(self, problem: str, options, filtered_pairs, doc, considerations, log_callback=None) -> DecisionResult:
         if log_callback:
             log_callback("start", {"model": "model2", "problem": problem})
         print("Executing Model 2: Second-Order Ego State Negotiations")
         sub_ego_responses = []
         for sub_state in self.workflows[DecisionModel.SECOND_ORDER_NEGOTIATIONS]["sub_ego_states"]:
-            response = self._call_openai_api(self._sub_ego_state_prompt(problem, sub_state, options))
+            response = self._call_openai_api(self._sub_ego_state_prompt(problem, sub_state, options, filtered_pairs))
             if log_callback:
                 log_callback("sub_ego_response", {"sub_state": sub_state, "raw_response": response})
             if doc:
@@ -1224,7 +2223,7 @@ Please summarise in clear, everyday language for a general audience.
         return final_decision
     
 
-    def _execute_model3(self, problem: str, options, doc, considerations, log_callback=None) -> DecisionResult:
+    def _execute_model3(self, problem: str, options, filtered_pairs, doc, considerations, log_callback=None) -> DecisionResult:
         if log_callback:
             log_callback("start", {"model": "model3", "problem": problem})
         print("Executing Model 3: Maslow-TA Decision Matrix")
@@ -1237,7 +2236,7 @@ Please summarise in clear, everyday language for a general audience.
                 ("Esteem", "Status, recognition, mastery, achievement, respect"),
                 ("Self-Actualization", "Purpose, growth, creativity, fulfilling potential")
             ]:
-                prompt = self._matrix_cell_prompt(problem, ego_state, maslow_level, desc, options)
+                prompt = self._matrix_cell_prompt(problem, ego_state, maslow_level, desc, options, filtered_pairs)
                 response = self._call_openai_api(prompt)
     
                 if log_callback:
@@ -1321,31 +2320,30 @@ Please summarise in clear, everyday language for a general audience.
     
         return final_decision
     
-    
-    
-    
-    def execute_workflow(self, model: DecisionModel, problem: str, options, doc, considerations=None, log_callback=None) -> DecisionResult:
+    def execute_workflow(self, model: DecisionModel, problem: str, options, filtered_pairs, doc, considerations=None, log_callback=None) -> DecisionResult:
         if model == DecisionModel.DEMOCRATIC_COUNCIL:
-            return self._execute_model1(problem, options, doc, considerations, log_callback)
+            return self._execute_model1(problem, options, filtered_pairs, doc, considerations, log_callback)
         elif model == DecisionModel.SECOND_ORDER_NEGOTIATIONS:
-            return self._execute_model2(problem, options, doc, considerations, log_callback)
+            return self._execute_model2(problem, options, filtered_pairs, doc, considerations, log_callback)
         elif model == DecisionModel.MASLOW_TA_MATRIX:
-            return self._execute_model3(problem, options, doc, considerations, log_callback)
+            return self._execute_model3(problem, options, filtered_pairs, doc, considerations, log_callback)
         else:
             raise ValueError(f"Unknown model: {model}")
-    
-    
-
 
     # ==== Prompt construction helpers with numeric IDs ====
 
-    def _ego_state_prompt(self, problem, ego_state, options):
-        option_str = "\n".join([f"- {opt['text']}" for opt in options])
+    def _ego_state_prompt(self, problem, ego_state, options, filtered_pairs):
+        '''
+        Constructs the prompt for Model 1 (Ego State Council) for a single ego state.
+        Includes context: problem statement, pre-filtered option+outcome pairs.
+        '''
+        option_str = "\n".join([f"- {get_option_text(opt)}" for opt in options])
+        context = self.format_context_for_prompt(problem, filtered_pairs)
         return f'''
-You are analyzing a decision problem from the perspective of the {ego_state} ego state in Transactional Analysis.
+{context}
+You are analyzing this decision problem from the perspective of the {ego_state} ego state in Transactional Analysis.
 
-Problem: {problem}
-Options:
+Options under consideration:
 {option_str}
 
 For each option, identify up to three types of consideration:
@@ -1368,6 +2366,7 @@ For each option, identify up to three types of consideration:
 
 Only include real, relevant considerations. Omit any type if there are no applicable reasons for that option.
 '''
+
 
 
     def _council_synthesis_prompt(self, problem, ego_responses):
@@ -1405,13 +2404,18 @@ Provide your synthesis in JSON format:
         }
         return sub_state_descriptions.get(sub_state, "Unknown")
 
-    def _sub_ego_state_prompt(self, problem, sub_state, options):
-        option_str = "\n".join([f"- {opt['text']}" for opt in options]) if options else ""
+    def _sub_ego_state_prompt(self, problem, sub_state, options, filtered_pairs):
+        '''
+        Constructs the prompt for Model 2 (Sub-Ego States), one sub-ego at a time.
+        Includes context: problem statement, pre-filtered option+outcome pairs.
+        '''
+        option_str = "\n".join([f"- {get_option_text(opt)}" for opt in options]) if options else ""
+        context = self.format_context_for_prompt(problem, filtered_pairs)
         return f'''
-You are analyzing a decision problem from the perspective of the {sub_state} sub-ego state in Second-Order Transactional Analysis.
+{context}
+You are analyzing this decision problem from the perspective of the {sub_state} sub-ego state in Second-Order Transactional Analysis.
 
-Problem: {problem}
-Options:
+Options under consideration:
 {option_str}
 
 {sub_state}: {self._sub_ego_state_desc(sub_state)}
@@ -1434,6 +2438,7 @@ For each option, identify up to three types of consideration:
   {{"type": "avoidance", "text": "...", "option": "Option Text Here", "score": 7}}
 ]
 '''
+
 
     def _cluster_dialogues_prompt(self, problem, sub_ego_responses):
         return f'''
@@ -1484,13 +2489,18 @@ Provide results in JSON format:
 }}
 '''
 
-    def _matrix_cell_prompt(self, problem, ego_state, maslow_level, maslow_desc, options):
-        option_str = "\n".join([f"- {opt['text']}" for opt in options]) if options else ""
-        return f"""
+    def _matrix_cell_prompt(self, problem, ego_state, maslow_level, maslow_desc, options, filtered_pairs):
+        '''
+        Constructs the prompt for Model 3 (Maslow-TA Matrix) for one cell (ego state x maslow level).
+        Includes context: problem statement, pre-filtered option+outcome pairs.
+        '''
+        option_str = "\n".join([f"- {get_option_text(opt)}" for opt in options]) if options else ""
+        context = self.format_context_for_prompt(problem, filtered_pairs)
+        return f'''
+{context}
 Evaluate how the decision impacts {maslow_level} needs from the {ego_state} ego state perspective.
 
-Problem: {problem}
-Options:
+Options under consideration:
 {option_str}
 
 {ego_state} Perspective:
@@ -1517,9 +2527,7 @@ Respond in valid JSON, as a flat list:
   {{"type": "avoidance", "text": "...", "option": "Option Text Here", "score": 5}},
   ...
 ]
-"""
-
-
+'''
 
     def _summarize_model_output_prompt(self, problem: str, model_output: Dict[str, Any]) -> str:
         '''
@@ -1538,6 +2546,23 @@ Model Output:
 Please summarize this information, highlighting the key recommendation, confidence,
 and any important conditions or detailed analysis. Format your response using Markdown.
 '''
+
+    @staticmethod
+    def format_context_for_prompt(problem, filtered_pairs):
+        '''
+        Builds a plain English block describing the original question, and all currently valid
+        (option, likely outcome) pairs, for injection at the top of each model's prompt.
+        '''
+        pairs = "\n".join(
+            [f'- Option: "{item["option_text"]}"\n  Likely outcome: "{item["likely_outcome"]}"'
+             for item in filtered_pairs]
+        )
+        return f'''Decision problem: {problem}
+
+Consider ONLY the following pre-validated options and their likely outcomes for your analysis:
+{pairs}
+'''
+    
 
 ####################################################################################################
 # Consideration Storage & Indexing
@@ -1566,8 +2591,8 @@ class ConsiderationProcessor:
         self._option_id_by_text = {} # Dict: canonical text → ID
 
     def set_options(self, options: list):
-        self._option_texts = [opt['text'] for opt in options]
-        self._option_id_by_text = {opt['text']: opt['id'] for opt in options}
+        self._option_texts = [get_option_text(opt) for opt in options]
+        self._option_id_by_text = {get_option_text(opt): opt['id'] for opt in options}
         self.logger(f"[ConsiderationDB][set_options] Canonical options: {self._option_texts}")
 
     def resolve_option(self, raw_option_text):
@@ -1799,17 +2824,15 @@ def add_spoken_synopsis_to_doc(doc, results):
 def main():
     '''
     Main entry point for the Decisionator tool.
-    - Prompts user for decision problem statement.
-    - Extracts decision options from problem.
-    - Runs all TA models and gathers results.
-    - Aggregates, deduplicates, and groups all considerations.
-    - Writes formatted Word report with tables, summaries, and appendices.
-    - Saves output to timestamped DOCX file.
     '''
-
     if OPENAI_API_KEY == "your-openai-api-key-here":
         print("ERROR: Please set your OpenAI API key in the OPENAI_API_KEY variable")
         return
+
+    if DEBUG_MODE:
+        test_line = "* **Financial Urgency:** The family needs significant income soon to pay for his daughter's school fees (due in 2 weeks: ~$300 USD equivalent) and general living expenses."
+        debug_process_specific_md_line(test_line)
+    
 
     # Prompt user for problem
     print("Please enter the decision problem you want to analyze.")
@@ -1863,24 +2886,124 @@ def main():
         sys.exit(1)
     print("Options detected:")
     for opt in options:
-        print(f"{opt['id']}: {opt['text']}")
+        print(f"{opt['id']}: {get_option_text(opt)}")
+
+    # === After extracting options, determine likely outcomes for each option ===
+    likely_outcomes = []
+    for opt in options:
+        prompt = f'''
+You are an expert in scenario analysis. Your task is to predict the **most likely realistic outcome** for the given decision option.
+
+**Instructions:**
+- Carefully read the full problem statement.
+- Take into account all factors, constraints, and context provided in the problem.
+- Use your own general knowledge and reasoning to augment or clarify the scenario as needed.
+- Think through any consequences or side effects, considering both direct and indirect effects.
+- Your outcome should represent what *actually* would most probably happen, not an ideal or worst-case, but the typical or most expected result.
+- Be specific and practical.
+
+**Option:** "{get_option_text(opt)}"
+**Full Problem Context:** "{problem}"
+
+Return as JSON with fields:
+{{
+  "option_id": "{opt['id']}",
+  "option_text": "{get_option_text(opt)}",
+  "likely_outcome": "<provide the most probable, concrete outcome here>"
+}}
+'''
+        response = controller._call_openai_api(prompt)
+        data = controller._handle_json_parse(response)
+        likely_outcomes.append(data)
+
+    print("\nLikely outcomes for each option:")
+    for item in likely_outcomes:
+        print(f"- {item.get('option_text', '[MISSING]')}: {item.get('likely_outcome', '[NO OUTCOME]')}")
+
+    # === Appraise (option, outcome) pairs for deleterious results ===
+    filtered_pairs = []
+    rejection_reasons = []
+    for item in likely_outcomes:
+        prompt = f'''
+Evaluate the following decision context. If choosing this option and the likely outcome as described would result in death or injury (to self or others), a logical impossibility, or breaking the law, say so.
+Context:
+Option: "{item['option_text']}"
+Likely outcome: "{item['likely_outcome']}"
+Return JSON:
+{{"is_deleterious": true/false, "reason": "<explanation>"}}
+'''
+        resp = controller._call_openai_api(prompt)
+        check = controller._handle_json_parse(resp)
+        if check.get("is_deleterious"):
+            rejection_reasons.append({
+                "option_text": item['option_text'],
+                "likely_outcome": item['likely_outcome'],
+                "reason": check.get("reason", "")
+            })
+        else:
+            filtered_pairs.append(item)
+
+    # If all are rejected, print explanations and abort:
+    if not filtered_pairs:
+        print("\nAll possible courses of action and their likely outcomes were rejected due to deleterious consequences:")
+        for rej in rejection_reasons:
+            print(f"- Option: {rej['option_text']}\n  Outcome: {rej['likely_outcome']}\n  Reason: {rej['reason']}\n")
+        print("No further decision processing can continue for this problem.")
+        sys.exit(0)
+
+    print("\nSurviving (option, likely outcome) pairs:")
+    for item in filtered_pairs:
+        print(f"- {item.get('option_text', '[MISSING]')}: {item.get('likely_outcome', '[NO OUTCOME]')}")
 
     docasm.add_heading("Options Considered", level=2)
     for opt in options:
-        docasm.add_paragraph(f"{opt['id']}: {opt['text']}")
+        docasm.add_paragraph(f"{opt['id']}: {get_option_text(opt)}")
 
-    # Set canonical options for consideration mapping
     processor.set_options(options)
 
-    print("\nTA Decision-Making Models Demo")
+    # ==== MODEL SELECTION MENU ====
+    print("\nTA Decision-Making Models Menu")
     print("=" * 50)
-    print(f"Problem: {problem}\n")
+    print("Which decision model would you like to run?")
+    print("  1: Democratic Ego State Council")
+    print("     - Simulates a council between the Parent, Adult, and Child ego states, synthesizing a consensus.\n")
+    print("  2: Second-Order Ego State Negotiations")
+    print("     - Considers nine sub-ego states and mimics a complex negotiation with weighted consensus.\n")
+    print("  3: Maslow-TA Decision Matrix")
+    print("     - Evaluates how each option meets the levels of Maslow’s Hierarchy of Needs, using a utility score.\n")
+    print("  4: All models (recommended for full analysis)")
 
-    models = [
-        DecisionModel.DEMOCRATIC_COUNCIL,
-        DecisionModel.SECOND_ORDER_NEGOTIATIONS,
-        DecisionModel.MASLOW_TA_MATRIX
-    ]
+    model_choice = None
+    valid_choices = {"1", "2", "3", "4"}
+    while True:
+        inp = input("Enter the number (1, 2, 3, or 4) of the model to run [4=all]: ").strip()
+        if inp in valid_choices:
+            if inp == "4":
+                model_choice = "all"
+            else:
+                model_choice = int(inp)
+            break
+        print("Invalid input. Please enter 1, 2, 3, or 4.")
+
+    if model_choice == "all":
+        models_to_run = [
+            DecisionModel.DEMOCRATIC_COUNCIL,
+            DecisionModel.SECOND_ORDER_NEGOTIATIONS,
+            DecisionModel.MASLOW_TA_MATRIX
+        ]
+    elif model_choice == 1:
+        models_to_run = [DecisionModel.DEMOCRATIC_COUNCIL]
+    elif model_choice == 2:
+        models_to_run = [DecisionModel.SECOND_ORDER_NEGOTIATIONS]
+    elif model_choice == 3:
+        models_to_run = [DecisionModel.MASLOW_TA_MATRIX]
+    else:
+        print("No valid model selected, exiting.")
+        sys.exit(1)
+
+    print("\nRunning the following models:")
+    for m in models_to_run:
+        print(" -", m.name.replace("_", " ").title())
 
     results = {}
     everyday_summaries = {}
@@ -1889,20 +3012,16 @@ def main():
     # ==== Considerations by Option (Chapter 3) ====
     docasm.add_page_break()
     docasm.add_heading("Decision Considerations (by Option)", level=1)
-    docasm.add_paragraph(
+    docasm.add_markdown(
         "The considerations listed below are grouped by decision option and categorized as follows:\n"
-        "• **Negative:** Arguments against choosing this option, based on possible negative outcomes if it is chosen. "
-        "These are typically shown with negative scores.\n"
-        "• **Avoidance:** Arguments in favor of this option, specifically because *not* choosing it would lead to negative consequences. "
-        "These are preventative or risk-avoiding reasons and are scored positively.\n"
-        "• **Positive:** Arguments directly in favor of this option, based on desirable outcomes if it is chosen. "
-        "These also have positive scores.\n\n"
-        "Within each table, considerations are ordered by score from most negative to most positive, regardless of category. "
-        "Avoidance and positive reasons are mingled, not separated. Zero-scored or neutral considerations are listed at the end."
+        "- **Negative:** Arguments against choosing this option, based on possible negative outcomes if it is chosen. These are typically shown with negative scores.\n"
+        "- **Avoidance:** Arguments in favor of this option, specifically because *not* choosing it would lead to negative consequences. These are preventative or risk-avoiding reasons and are scored positively.\n"
+        "- **Positive:** Arguments directly in favor of this option, based on desirable outcomes if it is chosen. These also have positive scores.\n\n"
+        "Where several considerations are highly similar, they are grouped together and summarized with an introductory sentence and bullet points."
     )
-    
+
     # --- Run models and collect considerations ---
-    for i, model in enumerate(models):
+    for i, model in enumerate(models_to_run):
         model_label = model.value
         print(f"\n{'='*10} Running Model {i+1}: {model.name.replace('_', ' ').title()} {'='*10}")
         model_steps = []
@@ -1913,6 +3032,7 @@ def main():
             model,
             problem,
             options,
+            filtered_pairs,
             doc=None,
             considerations=temp_considerations,
             log_callback=log_step
@@ -1920,60 +3040,102 @@ def main():
         processor.add_many(temp_considerations)
         results[model_label] = result
         steps_by_model[model_label] = model_steps
-    
+
         everyday_prompt = controller._everyday_language_summary_prompt(problem, asdict(result))
         everyday_summary = controller._call_openai_api(everyday_prompt)
         everyday_summaries[model_label] = everyday_summary
-    
+
     # -- Group considerations by option --
-    grouped = {opt['text']: processor.by_option_text(opt['text']) for opt in options}
+    grouped = {get_option_text(opt): processor.by_option_text(get_option_text(opt)) for opt in options}
     general_cons = processor.general()
     all_cons = processor.all()
-    
+
     # ---- Compute normalization for all considerations ----
     neg_scores = [float(c.score) for c in all_cons if c.type == "negative" and c.score is not None and float(c.score) < 0]
     pos_scores = [float(c.score) for c in all_cons if c.type in ("positive", "avoidance") and c.score is not None and float(c.score) > 0]
     min_neg = min(neg_scores) if neg_scores else -1
     max_pos = max(pos_scores) if pos_scores else 1
-    
+
+    # Build a mapping from option_text to rejection reason for easy lookup
+    rejection_by_option = {rej['option_text']: rej for rej in rejection_reasons}
+
     for opt in options:
-        opt_text = opt['text']
+        opt_text = get_option_text(opt)
         conslist = grouped.get(opt_text, [])
-        conslist = dedupe_considerations(conslist, similarity_cutoff=0.95)  # tweak this value as needed
-    
-        docasm.add_heading(f"{opt['id']}: {opt['text']}", level=2)
+        conslist = dedupe_considerations(conslist, similarity_cutoff=0.95)
+
+        docasm.add_heading(f"{opt['id']}: {get_option_text(opt)}", level=2)
+
+        # If this option was rejected, print its rejection reason and skip table
+        if opt_text in rejection_by_option:
+            rej = rejection_by_option[opt_text]
+            docasm.add_markdown(
+                f"This option was **rejected and excluded from further analysis** because:\n\n"
+                f"{rej['reason']}\n\n"
+                f"**Likely outcome if chosen:** {rej['likely_outcome']}"
+            )
+            continue
+
         if not conslist:
             docasm.add_paragraph("No considerations for this option.")
             continue
-    
-        # Unified sorting: all relevant types, sorted by score
-        all_cons_relevant = [c for c in conslist if c.type in {"negative", "avoidance", "positive"}]
-        all_cons_sorted = sorted(
-            all_cons_relevant,
-            key=lambda c: (float(c.score) if c.score is not None else 0, str(c.text).lower())
-        )
-        zeros = [c for c in conslist if (float(c.score) == 0 if c.score is not None else False)
-                                      and c.type not in {"negative", "avoidance", "positive"}]
-        ordered_conslist = all_cons_sorted + zeros
-    
-        add_considerations_table(docasm, ordered_conslist, min_neg, max_pos)
-    
+
+        # --- NEW AI-BASED GROUPING AND MERGING ---
+        merged_groups = merge_considerations_conceptually(conslist, controller, context_prompt=problem)
+        table = docasm.add_table(rows=1, cols=3)
+        hdr_cells = table.rows[0].cells
+        hdr_cells[0].text = 'Consideration'
+        hdr_cells[1].text = 'Type'
+        hdr_cells[2].text = 'Score'
+        style_table(table)
+
+        for group in merged_groups:
+            row_cells = table.add_row().cells
+            docasm.add_markdown_to_cell(row_cells[0], group['merged_text'])
+            row_cells[1].text = str(group['type'])
+            row_cells[2].text = f"{group['score']:.2f}" if group['score'] is not None else ''
+            try:
+                s = float(group['score'])
+            except Exception:
+                s = 0
+            if s < 0 or s > 0:
+                hexcolor = get_heatmap_color(s, min_neg, max_pos, group['type'])
+                if hexcolor:
+                    for cell in row_cells:
+                        cell._tc.get_or_add_tcPr().append(
+                            parse_xml(r'<w:shd {} w:fill="{}"/>'.format(nsdecls('w'), hexcolor))
+                        )
+
     # --- General considerations as usual ---
     docasm.add_heading("General Considerations (Not Tied to a Single Option)", level=2)
     general_cons_short = dedupe_considerations(general_cons, similarity_cutoff=0.95)
     if general_cons_short:
-        all_general = [c for c in general_cons_short if c.type in {"negative", "avoidance", "positive"}]
-        all_general_sorted = sorted(
-            all_general,
-            key=lambda c: (float(c.score) if c.score is not None else 0, str(c.text).lower())
-        )
-        zeros = [c for c in general_cons_short if (float(c.score) == 0 if c.score is not None else False)
-                                           and c.type not in {"negative", "avoidance", "positive"}]
-        ordered_general = all_general_sorted + zeros
-        add_considerations_table(docasm, ordered_general, min_neg, max_pos)
+        merged_groups = merge_considerations_conceptually(general_cons_short, controller, context_prompt=problem)
+        table = docasm.add_table(rows=1, cols=3)
+        hdr_cells = table.rows[0].cells
+        hdr_cells[0].text = 'Consideration'
+        hdr_cells[1].text = 'Type'
+        hdr_cells[2].text = 'Score'
+        style_table(table)
+
+        for group in merged_groups:
+            row_cells = table.add_row().cells
+            docasm.add_markdown_to_cell(row_cells[0], group['merged_text'])
+            row_cells[1].text = str(group['type'])
+            row_cells[2].text = f"{group['score']:.2f}" if group['score'] is not None else ''
+            try:
+                s = float(group['score'])
+            except Exception:
+                s = 0
+            if s < 0 or s > 0:
+                hexcolor = get_heatmap_color(s, min_neg, max_pos, group['type'])
+                if hexcolor:
+                    for cell in row_cells:
+                        cell._tc.get_or_add_tcPr().append(
+                            parse_xml(r'<w:shd {} w:fill="{}"/>'.format(nsdecls('w'), hexcolor))
+                        )
     else:
         docasm.add_paragraph("No general considerations were raised.")
-
 
     # ==== Chapter 2: Summaries and Conclusions ====
     docasm.add_page_break()
@@ -1982,32 +3144,35 @@ def main():
         "This section collects each model’s everyday-language summary and provides the AI's overall recommendation."
     )
 
-    for model_label in [m.value for m in models]:
+    for model_label in [m.value for m in models_to_run]:
         docasm.add_heading(f"{model_label.upper()} Model Summary", level=2)
         docasm.add_markdown(everyday_summaries[model_label])
 
-    overall_prompt = f'''
-Here is a decision problem and three different model outputs, each summarized in plain, everyday language.
-Your job is to give a clear, everyday-language overall conclusion and recommendation, comparing the different models, and explaining which model's advice makes the most sense in simple, practical terms.
-
-Original Question:
-{problem}
-
-Model 1 Summary:
-{everyday_summaries.get("model1", "")}
-
-Model 2 Summary:
-{everyday_summaries.get("model2", "")}
-
-Model 3 Summary:
-{everyday_summaries.get("model3", "")}
-
-**Please give your conclusion and recommendation for a general audience, using clear narrative or bullet points in Markdown. Do not use JSON or code blocks.**
-'''
+    # Build the overall summary prompt dynamically (robust for any model subset)
+    summary_lines = [
+        "Here is a decision problem and the following model output summaries, each written in plain, everyday language.",
+        "Your job is to give a clear, everyday-language overall conclusion and recommendation, comparing the model outputs provided below. Explain which model's advice makes the most sense in simple, practical terms.",
+        "",
+        f"Original Question:\n{problem}",
+        ""
+    ]
+    for model_label in [m.value for m in models_to_run]:
+        model_name_nice = {
+            "model1": "Model 1: Democratic Ego State Council",
+            "model2": "Model 2: Second-Order Ego State Negotiations",
+            "model3": "Model 3: Maslow-TA Decision Matrix"
+        }.get(model_label, model_label.upper())
+        summary_lines.append(f"{model_name_nice} Summary:\n{everyday_summaries[model_label]}\n")
+    summary_lines.append(
+        "**Please give your conclusion and recommendation for a general audience, using clear narrative or bullet points in Markdown. Do not use JSON or code blocks. Only refer to the models and summaries given above.**"
+    )
+    overall_prompt = "\n".join(summary_lines)
     overall_summary = controller._call_openai_api(overall_prompt)
     docasm.add_heading("Overall Conclusion and Recommendation", level=2)
     docasm.add_markdown(overall_summary)
 
+    ##Uncomment the following code block if detailed working for each model is required.
+    '''
     # --------- Appendix with Detailed Model Output (NO summary conclusions here) ---------
     docasm.add_page_break()
     docasm.add_heading("Appendix", level=1)
@@ -2015,10 +3180,10 @@ Model 3 Summary:
         "The findings presented in the main part of the document are summarised from the following detailed output from each decision model."
     )
 
-    for i, model in enumerate(models):
+    for i, model in enumerate(models_to_run):
         model_label = model.value
         docasm.add_heading(f"Model: {model_label.upper()}", level=2)
-        if model_label in model_synopses:
+        if model_label in globals().get('model_synopses', {}):
             docasm.add_paragraph(model_synopses[model_label], style='Intense Quote')
         docasm.add_heading("Workthrough", level=3)
         for step in steps_by_model[model_label]:
@@ -2038,8 +3203,9 @@ Model 3 Summary:
         summary_markdown = controller._call_openai_api(summary_prompt)
         docasm.add_heading("AI Summary of Model Results", level=4)
         docasm.add_markdown(summary_markdown)
-        if i < len(models) - 1:
+        if i < len(models_to_run) - 1:
             docasm.add_page_break()
+    '''
 
     # --------- Save document ---------
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
