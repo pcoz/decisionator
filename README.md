@@ -41,7 +41,7 @@ This tool is ideal for business analysts, technical leaders, organizational psyc
 You can install all required dependencies with:
 
 ```sh
-pip install openai python-docx numpy
+pip install openai python-docx numpy markdown
 ````
 
 ---
