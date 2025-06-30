@@ -60,7 +60,7 @@ import itertools
 
 from docx.shared import Inches
 
-##Detect debug mode
+##Debug mode====================================================================================
 import argparse
 
 DEBUG_MODE = False
@@ -70,6 +70,21 @@ if __name__ == "__main__":
     args, unknown = parser.parse_known_args()
     DEBUG_MODE = args.debug
 
+DEBUG_DUMP_PATH = "debug_md_trace.txt"
+
+def debug_dump(label, text):
+    if not DEBUG_MODE:
+        return
+    try:
+        with open(DEBUG_DUMP_PATH, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*60}\n[{label}]\n{text}\n")
+    except Exception as e:
+        dprint(f"[DEBUG] Failed to write debug dump: {e}")
+        
+def dprint(*args, **kwargs):
+    """Prints '[DEBUG]' and the message only if DEBUG_MODE is True."""
+    if DEBUG_MODE:
+        print("[DEBUG]", *args, **kwargs)
 
 ####################################################################################################
 # Helper functions for Markdown and Word document operations
@@ -80,7 +95,131 @@ def is_markdown(text):
     Returns True if so, else False.
     '''
     return any(s in text for s in ('# ', '## ', '### ', '**', '`', '* '))
+    
+# ============================================================================================
+# Bomb-Proof Markdown Numbered List Renumbering
+# Replaces standard renumber_markdown_lists for handling all edge cases robustly
+# ============================================================================================
+import re
+from typing import List, Tuple, Optional
+from dataclasses import dataclass
 
+@dataclass
+class ListItem:
+    line_idx: int
+    indent_level: int
+    original_number: int
+    content: str
+    full_line: str
+
+@dataclass
+class ListBlock:
+    items: List[ListItem]
+    start_line: int
+    end_line: int
+    base_indent: int
+
+def renumber_markdown_lists(md_text: str) -> str:
+    """
+    Comprehensive markdown list renumbering that handles all edge cases.
+    - Resets all *top-level* numbered lists to start from 1 (even if badly numbered in source).
+    - Ignores code blocks and markdown headings.
+    - Works with blank lines, headings, code blocks, mixed indentation, etc.
+    """
+    lines = md_text.split('\n')
+    # Phase 1: Identify protected regions (code blocks, headings)
+    protected_regions = _find_protected_regions(lines)
+    # Phase 2: Find all numbered list blocks
+    list_blocks = _find_list_blocks(lines, protected_regions)
+    # Phase 3: Renumber lists and reconstruct document
+    return _reconstruct_document(lines, list_blocks)
+
+def _find_protected_regions(lines: List[str]) -> List[Tuple[int, int]]:
+    protected = []
+    in_code_block = False
+    code_start = None
+    for i, line in enumerate(lines):
+        if re.match(r'^\s*```', line):
+            if in_code_block:
+                protected.append((code_start, i))
+                in_code_block = False
+            else:
+                code_start = i
+                in_code_block = True
+        elif re.match(r'^\s*#{1,6}\s+', line):
+            protected.append((i, i))
+    if in_code_block:
+        protected.append((code_start, len(lines) - 1))
+    return protected
+
+def _is_in_protected_region(line_idx: int, protected_regions: List[Tuple[int, int]]) -> bool:
+    return any(start <= line_idx <= end for start, end in protected_regions)
+
+def _parse_list_item(line: str) -> Optional[Tuple[int, int, str]]:
+    match = re.match(r'^(\s*)(\d+)[.)]\s+(.+)$', line)
+    if match:
+        indent_str, number_str, content = match.groups()
+        return len(indent_str), int(number_str), content
+    return None
+
+def _find_list_blocks(lines: List[str], protected_regions: List[Tuple[int, int]]) -> List[ListBlock]:
+    list_blocks = []
+    current_block_items = []
+    current_base_indent = None
+    for i, line in enumerate(lines):
+        if _is_in_protected_region(i, protected_regions):
+            if current_block_items:
+                list_blocks.append(_finalize_block(current_block_items))
+                current_block_items = []
+                current_base_indent = None
+            continue
+        parsed = _parse_list_item(line)
+        if parsed:
+            indent_level, number, content = parsed
+            if (current_block_items and current_base_indent is not None
+                and indent_level == current_base_indent
+                and _is_block_continuation(lines, i, current_block_items[-1].line_idx)):
+                current_block_items.append(ListItem(i, indent_level, number, content, line))
+            else:
+                if current_block_items:
+                    list_blocks.append(_finalize_block(current_block_items))
+                current_block_items = [ListItem(i, indent_level, number, content, line)]
+                current_base_indent = indent_level
+        else:
+            if line.strip() == "":
+                continue
+            else:
+                if current_block_items:
+                    list_blocks.append(_finalize_block(current_block_items))
+                    current_block_items = []
+                    current_base_indent = None
+    if current_block_items:
+        list_blocks.append(_finalize_block(current_block_items))
+    return list_blocks
+
+def _is_block_continuation(lines: List[str], current_idx: int, last_item_idx: int) -> bool:
+    for i in range(last_item_idx + 1, current_idx):
+        line = lines[i].strip()
+        if line and not line.startswith('#'):
+            return False
+    return True
+
+def _finalize_block(items: List[ListItem]) -> ListBlock:
+    return ListBlock(
+        items=items,
+        start_line=items[0].line_idx,
+        end_line=items[-1].line_idx,
+        base_indent=items[0].indent_level
+    )
+
+def _reconstruct_document(lines: List[str], list_blocks: List[ListBlock]) -> str:
+    result_lines = lines.copy()
+    for block in list_blocks:
+        for new_number, item in enumerate(block.items, 1):
+            indent = ' ' * item.indent_level
+            new_line = f"{indent}{new_number}. {item.content}"
+            result_lines[item.line_idx] = new_line
+    return '\n'.join(result_lines)
 
 
 class DocAssembler:
@@ -149,7 +288,9 @@ class DocAssembler:
         """Normalize text by handling different line endings and excessive whitespace."""
         # Convert different line endings to \n
         text = re.sub(r'\r\n|\r', '\n', text)
-        
+        if DEBUG_MODE:
+            debug_dump("After normalization", text)
+
         # Remove trailing whitespace from lines
         lines = [line.rstrip() for line in text.split('\n')]
         
@@ -159,17 +300,20 @@ class DocAssembler:
         """Split text into logical blocks (paragraphs, code blocks, lists, etc.)."""
         blocks = []
         lines = text.split('\n')
+        if DEBUG_MODE:
+            debug_dump("Input to _split_into_blocks", "\n".join(lines))
         current_block = []
         in_code_block = False
         code_block_lang = None
         in_table = False
-        
+        in_list = False  # NEW: Track if we are in a list block
+    
         i = 0
         while i < len(lines):
             line = lines[i]
             stripped = line.strip()
-            
-            # Handle code blocks
+    
+            # --- Code blocks ---
             if stripped.startswith('```'):
                 if in_code_block:
                     # End of code block
@@ -185,30 +329,34 @@ class DocAssembler:
                 else:
                     # Start of code block
                     if current_block:
-                        blocks.append({'type': 'paragraph', 'content': '\n'.join(current_block)})
+                        # Flush current block (paragraph/list/etc)
+                        block_type = 'list' if in_list else 'paragraph'
+                        blocks.append({'type': block_type, 'content': '\n'.join(current_block)})
                         current_block = []
-                    
+                        in_list = False
                     code_block_lang = stripped[3:].strip() if len(stripped) > 3 else None
                     current_block.append(line)
                     in_code_block = True
                 i += 1
                 continue
-            
+    
             if in_code_block:
                 current_block.append(line)
                 i += 1
                 continue
-            
-            # Handle tables
+    
+            # --- Tables ---
             if '|' in stripped and stripped.count('|') >= 2:
                 if not in_table:
                     if current_block:
-                        blocks.append({'type': 'paragraph', 'content': '\n'.join(current_block)})
+                        block_type = 'list' if in_list else 'paragraph'
+                        blocks.append({'type': block_type, 'content': '\n'.join(current_block)})
                         current_block = []
+                        in_list = False
                     in_table = True
                 current_block.append(line)
             elif in_table and stripped == '':
-                # End of table
+                # End of table on blank line
                 blocks.append({'type': 'table', 'content': '\n'.join(current_block)})
                 current_block = []
                 in_table = False
@@ -217,55 +365,72 @@ class DocAssembler:
                 blocks.append({'type': 'table', 'content': '\n'.join(current_block)})
                 current_block = [line]
                 in_table = False
-            
-            # Handle lists
+    
+            # --- Lists (robust detection & flush on non-list) ---
             elif self._is_list_item(stripped):
-                if current_block and not self._is_list_item(current_block[-1].strip()):
-                    blocks.append({'type': 'paragraph', 'content': '\n'.join(current_block)})
-                    current_block = []
+                if not in_list:
+                    if current_block:
+                        # Flush previous block (paragraph, etc.)
+                        blocks.append({'type': 'paragraph', 'content': '\n'.join(current_block)})
+                        current_block = []
+                    in_list = True
                 current_block.append(line)
-            
-            # Handle headers
-            elif stripped.startswith('#'):
-                if current_block:
-                    blocks.append(self._determine_block_type('\n'.join(current_block)))
-                    current_block = []
-                blocks.append({'type': 'header', 'content': line})
-            
-            # Handle horizontal rules
-            elif re.match(r'^[-*_]{3,}$', stripped):
-                if current_block:
-                    blocks.append(self._determine_block_type('\n'.join(current_block)))
-                    current_block = []
-                blocks.append({'type': 'hr', 'content': line})
-            
-            # Handle blockquotes
-            elif stripped.startswith('>'):
-                if current_block and not current_block[-1].strip().startswith('>'):
-                    blocks.append(self._determine_block_type('\n'.join(current_block)))
-                    current_block = []
-                current_block.append(line)
-            
-            # Handle empty lines
-            elif stripped == '':
-                if current_block:
-                    blocks.append(self._determine_block_type('\n'.join(current_block)))
-                    current_block = []
-            
-            # Regular content
             else:
-                current_block.append(line)
-            
+                # If we were in a list and now not a list: flush list block
+                if in_list and current_block:
+                    blocks.append({'type': 'list', 'content': '\n'.join(current_block)})
+                    current_block = []
+                    in_list = False
+    
+                # --- Headers ---
+                if stripped.startswith('#'):
+                    if current_block:
+                        blocks.append({'type': 'paragraph', 'content': '\n'.join(current_block)})
+                        current_block = []
+                    blocks.append({'type': 'header', 'content': line})
+    
+                # --- Horizontal rules ---
+                elif re.match(r'^[-*_]{3,}$', stripped):
+                    if current_block:
+                        blocks.append({'type': 'paragraph', 'content': '\n'.join(current_block)})
+                        current_block = []
+                    blocks.append({'type': 'hr', 'content': line})
+    
+                # --- Blockquotes ---
+                elif stripped.startswith('>'):
+                    if current_block and not current_block[-1].strip().startswith('>'):
+                        blocks.append({'type': 'paragraph', 'content': '\n'.join(current_block)})
+                        current_block = []
+                    current_block.append(line)
+    
+                # --- Empty lines ---
+                elif stripped == '':
+                    if current_block:
+                        blocks.append({'type': 'paragraph', 'content': '\n'.join(current_block)})
+                        current_block = []
+    
+                # --- Regular content (paragraphs) ---
+                else:
+                    current_block.append(line)
             i += 1
-        
-        # Handle remaining content
+    
+        # --- Handle any trailing content ---
         if current_block:
-            if in_table:
+            if in_code_block:
+                blocks.append({'type': 'code_block', 'content': '\n'.join(current_block), 'language': code_block_lang})
+            elif in_table:
                 blocks.append({'type': 'table', 'content': '\n'.join(current_block)})
+            elif in_list:
+                blocks.append({'type': 'list', 'content': '\n'.join(current_block)})
             else:
-                blocks.append(self._determine_block_type('\n'.join(current_block)))
-        
+                blocks.append({'type': 'paragraph', 'content': '\n'.join(current_block)})
+    
+        if DEBUG_MODE:
+            from pprint import pformat
+            debug_dump("Blocks from _split_into_blocks", pformat(blocks))
+    
         return blocks
+    
     
     def _determine_block_type(self, content):
         """Determine the type of a content block."""
@@ -308,6 +473,8 @@ class DocAssembler:
     
     def _parse_block(self, block):
         """Parse a single block based on its type."""
+        if DEBUG_MODE:
+            debug_dump(f"Block received by _parse_block [{block.get('type', 'paragraph')}]", block.get('content', ''))
         block_type = block.get('type', 'paragraph')
         content = block.get('content', '')
         
@@ -382,6 +549,8 @@ class DocAssembler:
         lines = content.split('\n')
         
         for line in lines:
+            if DEBUG_MODE:
+                debug_dump("Line in _parse_list", line)
             stripped = line.strip()
             if not stripped or not self._is_list_item(stripped):
                 continue
@@ -1048,7 +1217,7 @@ Context: {context_prompt}
 
 This is a list of considerations of type '{bucket_type}' ({bucket_score_sign}). Each has a unique 'ID'.
 
-**Task:** For the list below, look for any two or more considerations that express the *same core idea or reasoning* (not just of the same type, but actually conceptually redundant or overlapping). If you find any such group, propose a single merged version as shown below.
+**Task:** For the list below, look for any two or more considerations that express the *same core idea or reasoning* (not just of the same type, but actually conceptually redundant or overlapping) **and that start with similar wording**. If you find any such group, propose a single merged version as shown below.
 
 Respond in **valid JSON** as:
 
@@ -1224,51 +1393,6 @@ def _find_bullet_start(lines: List[str]) -> Tuple[Optional[int], List[str]]:
             if re.match(pattern, stripped):
                 return i, bullet_patterns
     return None, bullet_patterns
-
-
-##Debug helper function
-def debug_process_specific_md_line(md_line, logger=None):
-    print("\n[DEBUG] Processing specific MD line:")
-    print(f"  RAW: {repr(md_line)}")
-
-    # Step 1: Normalization (as your markdown helpers do)
-    norm = md_line.expandtabs(4).rstrip('\n').strip()
-    print(f"  Normalized: {repr(norm)}")
-
-    # Step 2: Bullet detection (patterns as per your _find_bullet_start)
-    bullet_patterns = [
-        r'^\s*[-•*+]\s+', r'^\s*\d+\.\s+', r'^\s*[a-zA-Z]\.\s+',
-        r'^\s*→\s+', r'^\s*▪\s+', r'^\s*◦\s+', r'^\s*‣\s+',
-        r'^\s*·\s+', r'^\s*⁃\s+', r'^\s*—\s+', r'^\s*•\s+',
-        r'^\s*\(\d+\)\s+', r'^\s*\([a-zA-Z]\)\s+',
-    ]
-    matched = None
-    for pattern in bullet_patterns:
-        if re.match(pattern, norm):
-            matched = pattern
-            break
-    print(f"  Bullet pattern matched: {matched}")
-
-    # Step 3: Extract bullet content if matched
-    if matched:
-        match = re.match(matched, norm)
-        bullet_content = norm[match.end():].strip()
-        print(f"  Bullet content after marker: {repr(bullet_content)}")
-    else:
-        print("  No bullet pattern matched, treating as paragraph.")
-
-    # Step 4: Inline formatting detection (bold/italic)
-    # (Use your own parsing logic, here a quick scan)
-    bold = re.findall(r'\*\*(.+?)\*\*', norm)
-    italic = re.findall(r'\*(.+?)\*', norm)
-    print(f"  Detected bold: {bold}")
-    print(f"  Detected italic: {italic}")
-
-    # Optional: Show how this would be added to a docx cell
-    print("  Would be added as a bullet paragraph with parsed bold/italic in docx (if not in code block).")
-
-    print("[DEBUG] Finished processing specific MD line.\n")
-##
 
 def _process_intro_section(lines: List[str], strip_html: bool, logger: logging.Logger) -> str:
     """Process introduction section before bullets."""
@@ -1561,6 +1685,44 @@ class Consideration:
     score: float = None
     extra: dict = field(default_factory=dict)
     field_id: str = None
+
+@dataclass
+class DecomposedEventuality:
+    """Stores one possible eventuality, split into ethos, logos, energeia aspects."""
+    option: str
+    likely_outcome: str
+    ethos: Optional[str]
+    logos: Optional[str]
+    energeia: Optional[str]
+
+@dataclass
+class StrandAssessment:
+    """Stores the assessment of an aspect by an ego state."""
+    option: str          # <-- add this line
+    strand: str
+    aspect_text: str
+    ego_state: str
+    assessment: str
+    score: float
+    reasoning: str
+
+
+@dataclass
+class Model4Result:
+    """Stores all outputs for Model 4."""
+    decompositions: List[DecomposedEventuality]
+    assessments_by_ego: Dict[str, List[StrandAssessment]]
+    overall_assessments: List[Dict[str, Any]]
+    strandwise_best: Dict[str, Dict[str, Any]]
+    final_conclusion: Dict[str, Any]
+
+    # Add dummy attributes for uniform result interface
+    recommendation: str = None
+    confidence_score: float = None
+    conditions: List[str] = field(default_factory=list)
+    reasoning: str = None
+
+##======================================================================================
 
 def extract_numeric(val):
     '''
@@ -1935,8 +2097,8 @@ Please summarise in clear, everyday language for a general audience.
             data = json.loads(sanitized)
             log_api_data("API_PARSED", data)
             
-            print("[DEBUG] Raw model response:", response)
-            print("[DEBUG] Sanitized for JSON:", sanitized)
+            dprint("[DEBUG] Raw model response:", response)
+            dprint("[DEBUG] Sanitized for JSON:", sanitized)
 
             return data
         except Exception as e:
@@ -1997,7 +2159,7 @@ Please summarise in clear, everyday language for a general audience.
             content = response.choices[0].message.content.strip(
             ) if response.choices else ""
             # DEBUG: See what the model sends
-            print(f"API raw response: {content!r}")
+            dprint(f"API raw response: {content!r}")
             log_api_data("API_RAW", content)
             return content
         except Exception as e:
@@ -2110,7 +2272,7 @@ Please summarise in clear, everyday language for a general audience.
         if log_callback:
             log_callback("final_decision", asdict(decision))
     
-        print(f"[DEBUG] considerations: {[asdict(c) for c in considerations]}")
+        dprint(f"[DEBUG] considerations: {[asdict(c) for c in considerations]}")
     
         return decision
 
@@ -2218,7 +2380,7 @@ Please summarise in clear, everyday language for a general audience.
         if log_callback:
             log_callback("final_decision", asdict(final_decision))
     
-        print(f"[DEBUG] considerations: {[asdict(c) for c in considerations]}")
+        dprint(f"[DEBUG] considerations: {[asdict(c) for c in considerations]}")
     
         return final_decision
     
@@ -2316,7 +2478,7 @@ Please summarise in clear, everyday language for a general audience.
         if log_callback:
             log_callback("final_decision", asdict(final_decision))
     
-        print(f"[DEBUG] considerations: {[asdict(c) for c in considerations]}")
+        dprint(f"[DEBUG] considerations: {[asdict(c) for c in considerations]}")
     
         return final_decision
     
@@ -2563,6 +2725,241 @@ Consider ONLY the following pre-validated options and their likely outcomes for 
 {pairs}
 '''
     
+    def _decompose_eventuality_prompt(self, option, likely_outcome, context_block):
+        """Prompt: split the eventuality into ethos, logos, energeia aspects."""
+        return f"""
+You are to decompose a decision eventuality into three classical aspects:
+
+- **Ethos:** The aspect relating to principles, values, character, duty, or what is 'right'.
+- **Logos:** The aspect relating to rational mechanisms, evidence, how it works.
+- **Energeia:** The aspect relating to active benefit, motivation, what makes it good, attractive, or energising.
+
+Given:
+Option: "{option}"
+Likely Outcome: "{likely_outcome}"
+{context_block}
+
+Respond in JSON:
+{{
+  "ethos": "<ethos aspect, or null if not present>",
+  "logos": "<logos aspect, or null if not present>",
+  "energeia": "<energeia aspect, or null if not present>"
+}}
+"""
+    
+    def _strand_assessment_prompt(self, strand, aspect_text, ego_state, option, likely_outcome, context_block):
+        """Prompt: pass the strand/aspect to the corresponding ego state for assessment."""
+        strand_desc = {
+            "ethos": "principles, values, character, or duty",
+            "logos": "rationality, mechanism, evidence, or process",
+            "energeia": "motivation, benefit, or inherent goodness"
+        }[strand.lower()]
+        return f"""
+You are the {ego_state} ego state in Transactional Analysis.
+
+Assess the following {strand} aspect of a decision eventuality, which is about {strand_desc}:
+
+Aspect: "{aspect_text}"
+Option: "{option}"
+Likely Outcome: "{likely_outcome}"
+{context_block}
+
+Rate this aspect for how well it satisfies the {ego_state} ego state's standards or interests.
+
+Respond in JSON:
+{{
+  "assessment": "<short assessment text>",
+  "score": <number, -10 (worst) to +10 (best)>,
+  "reasoning": "<detailed explanation>"
+}}
+"""
+    
+    def _overall_eventuality_assessment_prompt(self, assessments, option, likely_outcome, context_block):
+        """Prompt: synthesize the three ego state assessments for this eventuality into an overall evaluation."""
+        return f"""
+You are to provide an integrated assessment of a decision eventuality, based on the following assessments:
+
+Assessments:
+{json.dumps(assessments, indent=2)}
+
+Option: "{option}"
+Likely Outcome: "{likely_outcome}"
+{context_block}
+
+Respond in JSON:
+{{
+  "overall_assessment": "<short verdict>",
+  "score": <number, -10 (worst) to +10 (best)>,
+  "reasoning": "<summary explanation>"
+}}
+"""
+    
+    def _strandwise_best_choice_prompt(self, all_strand_assessments, strand, context_block):
+        """Prompt: For each strand, select the best option according to the ego state that owns that strand."""
+        return f"""
+You are to select the best option from among several, focusing only on the {strand} aspect:
+
+Assessments (for {strand}):
+{json.dumps(all_strand_assessments, indent=2)}
+
+{context_block}
+
+Respond in JSON:
+{{
+  "best_option": "<option text>",
+  "reasoning": "<explain why this option is best for this aspect>"
+}}
+"""
+    
+    def _strandwise_final_discussion_prompt(self, strandwise_bests, all_assessments, context_block):
+        """Prompt: The three ego states discuss and decide on a final, sensible, reasoned conclusion, considering why they chose their preferred aspect."""
+        return f"""
+The Parent, Adult, and Child ego states each chose a different 'best' option for their respective aspect:
+
+Strandwise Bests:
+{json.dumps(strandwise_bests, indent=2)}
+
+Here are all their assessments (by aspect):
+{json.dumps(all_assessments, indent=2)}
+
+Discuss why each ego state chose its best, and try to reach a reasoned, sensible group conclusion.
+
+Respond in JSON:
+{{
+  "final_decision": "<chosen course of action>",
+  "reasoning": "<sensible narrative: why this was chosen after group discussion>"
+}}
+"""
+
+    def execute_model4(self, problem, options, filtered_pairs, doc, considerations=None, log_callback=None, ancillary_info="") -> Model4Result:
+        print("Executing Model 4: Trichotomic Classical Decomposition")
+        context_block = f"\nBackground/Context:\n{ancillary_info}\n" if ancillary_info else ""
+            
+        # 1. Decompose each (option, likely outcome) into ethos, logos, energeia
+        decompositions = []
+        for item in filtered_pairs:
+            option = item["option_text"]
+            likely_outcome = item["likely_outcome"]
+            prompt = self._decompose_eventuality_prompt(option, likely_outcome, context_block)
+            resp = self._call_openai_api(prompt)
+            data = self._handle_json_parse(resp)
+            decompositions.append(
+                DecomposedEventuality(
+                    option=option,
+                    likely_outcome=likely_outcome,
+                    ethos=data.get("ethos"),
+                    logos=data.get("logos"),
+                    energeia=data.get("energeia"),
+                )
+            )
+    
+        # 2. For each aspect of each eventuality, pass to corresponding ego state
+        assessments_by_ego = {"Parent": [], "Adult": [], "Child": []}
+        for decomp in decompositions:
+            for strand, ego_state in [("ethos", "Parent"), ("logos", "Adult"), ("energeia", "Child")]:
+                aspect_text = getattr(decomp, strand)
+                if aspect_text:
+                    prompt = self._strand_assessment_prompt(strand, aspect_text, ego_state, decomp.option, decomp.likely_outcome, context_block)
+                    resp = self._call_openai_api(prompt)
+                    data = self._handle_json_parse(resp)
+                    assessments_by_ego[ego_state].append(
+                        StrandAssessment(
+                            option=decomp.option,                   
+                            strand=strand.title(),
+                            aspect_text=aspect_text,
+                            ego_state=ego_state,
+                            assessment=data.get("assessment"),
+                            score=float(data.get("score", 0)),
+                            reasoning=data.get("reasoning"),
+                        )               
+                    )
+    
+        # 3. Overall assessment of each eventuality
+        overall_assessments = []
+        for i, decomp in enumerate(decompositions):
+            aspects = []
+            for strand, ego_state in [("ethos", "Parent"), ("logos", "Adult"), ("energeia", "Child")]:
+                lst = [a for a in assessments_by_ego[ego_state] if a.strand.lower() == strand and a.aspect_text == getattr(decomp, strand)]
+                if lst:
+                    a = lst[0]
+                    aspects.append({
+                        "strand": strand.title(),
+                        "ego_state": ego_state,
+                        "assessment": a.assessment,
+                        "score": a.score,
+                        "reasoning": a.reasoning
+                    })
+            prompt = self._overall_eventuality_assessment_prompt(aspects, decomp.option, decomp.likely_outcome, context_block)
+            resp = self._call_openai_api(prompt)
+            data = self._handle_json_parse(resp)
+            overall_assessments.append({
+                "option": decomp.option,
+                "likely_outcome": decomp.likely_outcome,
+                "strand_assessments": aspects,
+                "overall_assessment": data.get("overall_assessment"),
+                "score": float(data.get("score", 0)),
+                "reasoning": data.get("reasoning")
+            })
+    
+        # 4. Strandwise best: for each strand/ego, pick the best option
+        strandwise_best = {}
+        for strand, ego_state in [("ethos", "Parent"), ("logos", "Adult"), ("energeia", "Child")]:
+            all_strand_assessments = [
+                {
+                    "option": decomp.option,
+                    "aspect_text": getattr(decomp, strand),
+                    "assessment": [
+                        a for a in assessments_by_ego[ego_state] if a.strand.lower() == strand and a.aspect_text == getattr(decomp, strand)
+                    ][0] if getattr(decomp, strand) else None
+                }
+                for decomp in decompositions
+            ]
+            # Only pass those that have a real assessment
+            relevant = [
+                {
+                    "option": s["option"],
+                    "aspect_text": s["aspect_text"],
+                    "assessment": {
+                        "assessment": s["assessment"].assessment,
+                        "score": s["assessment"].score,
+                        "reasoning": s["assessment"].reasoning
+                    } if s["assessment"] else None
+                }
+                for s in all_strand_assessments if s["assessment"]
+            ]
+            if relevant:
+                prompt = self._strandwise_best_choice_prompt(relevant, strand, context_block)
+                resp = self._call_openai_api(prompt)
+                data = self._handle_json_parse(resp)
+                strandwise_best[strand.title()] = {
+                    "best_option": data.get("best_option"),
+                    "reasoning": data.get("reasoning")
+                }
+    
+        # 5. Ego states discuss and decide on a final conclusion
+        prompt = self._strandwise_final_discussion_prompt(strandwise_best, overall_assessments, context_block)
+        resp = self._call_openai_api(prompt)
+        data = self._handle_json_parse(resp)
+        final_conclusion = {
+            "final_decision": data.get("final_decision"),
+            "reasoning": data.get("reasoning")
+        }
+    
+        # 6. Return as Model4Result
+        return Model4Result(
+            decompositions=decompositions,
+            assessments_by_ego=assessments_by_ego,
+            overall_assessments=overall_assessments,
+            strandwise_best=strandwise_best,
+            final_conclusion=final_conclusion,
+            # Dummy values for classic result fields (for API uniformity)
+            recommendation=final_conclusion.get("final_decision") or "No conclusion given",
+            confidence_score=None,  # If you have a score, set it here; else leave as None
+            conditions=[],
+            reasoning=final_conclusion.get("reasoning") or "See Model 4 group discussion."
+        )
+        
+
 
 ####################################################################################################
 # Consideration Storage & Indexing
@@ -2610,42 +3007,42 @@ class ConsiderationProcessor:
     def add(self, cons):
         print("[DEBUG][add] Adding consideration:", cons)
         self._table.append(cons)
-        print(f"[DEBUG][add] _table now has {len(self._table)} items.")
+        dprint(f"[DEBUG][add] _table now has {len(self._table)} items.")
         option_text = getattr(cons, 'option', None)
         option_id = getattr(cons, 'option_id', None)
         canonical_option = None
-        print(f"[DEBUG][add] option_text: {option_text}, option_id: {option_id}")
+        dprint(f"[DEBUG][add] option_text: {option_text}, option_id: {option_id}")
         if option_text:
             canonical_option = self.resolve_option(option_text)
-            print(f"[DEBUG][add] canonical_option resolved: {canonical_option}")
+            dprint(f"[DEBUG][add] canonical_option resolved: {canonical_option}")
             if canonical_option:
                 cons.option = canonical_option
                 self._by_option_text.setdefault(canonical_option, []).append(cons)
-                print(f"[DEBUG][add] Added to _by_option_text under {canonical_option}.")
+                dprint(f"[DEBUG][add] Added to _by_option_text under {canonical_option}.")
             else:
                 self._general.append(cons)
-                print(f"[DEBUG][add] Option text not resolved, added to _general.")
+                dprint(f"[DEBUG][add] Option text not resolved, added to _general.")
         else:
             self._general.append(cons)
-            print(f"[DEBUG][add] No option_text, added to _general.")
+            dprint(f"[DEBUG][add] No option_text, added to _general.")
         if option_id:
             self._by_option_id.setdefault(option_id, []).append(cons)
-            print(f"[DEBUG][add] Added to _by_option_id under {option_id}.")
+            dprint(f"[DEBUG][add] Added to _by_option_id under {option_id}.")
         model = getattr(cons, 'source_model', None)
         if model:
             self._by_model.setdefault(model, []).append(cons)
-            print(f"[DEBUG][add] Added to _by_model under {model}.")
+            dprint(f"[DEBUG][add] Added to _by_model under {model}.")
         context = getattr(cons, 'source_context', None)
         if context:
             self._by_context.setdefault(context, []).append(cons)
-            print(f"[DEBUG][add] Added to _by_context under {context}.")
+            dprint(f"[DEBUG][add] Added to _by_context under {context}.")
         self.logger(
             f"[ConsiderationDB][add] Added: model={model}, option_text={option_text}, "
             f"canonical_option={canonical_option}, option_id={option_id}, "
             f"context={context}, orientation={getattr(cons,'orientation',None)}, "
             f"text={getattr(cons,'text','')[:90]}"
         )
-        print(f"[DEBUG][add] Completed processing for: {getattr(cons, 'text', '')[:40]}...")
+        dprint(f"[DEBUG][add] Completed processing for: {getattr(cons, 'text', '')[:40]}...")
 
     def add_many(self, conslist):
         print(f"[ConsiderationDB][add_many] Called with {len(conslist)} considerations")
@@ -2713,22 +3110,29 @@ class ConsiderationProcessor:
 # --- Model synopses ---
 model_synopses = {
     "model1": (
-    "Model 1: Democratic Ego State Council\n"
-    "This model simulates a decision as an internal council between the three core ego states of Transactional Analysis: Parent, Adult, and Child. "
-    "Each ego state independently considers the problem, then the responses are synthesized into a council discussion. "
-    "The final recommendation is based on consensus or majority among the three voices."
-),
+        "Model 1: Democratic Ego State Council\n"
+        "This model simulates a decision as an internal council between the three core ego states of Transactional Analysis: Parent, Adult, and Child. "
+        "Each ego state independently considers the problem, then the responses are synthesized into a council discussion. "
+        "The final recommendation is based on consensus or majority among the three voices."
+    ),
     "model2": (
-    "Model 2: Second-Order Ego State Negotiations\n"
-    "This model considers the nuanced perspectives of nine sub-ego states (Parent-in-Parent, Adult-in-Parent, etc.). "
-    "It mimics a more complex negotiation process with internal 'clusters' and cross-cluster horse-trading, before arriving at a weighted consensus."
-),
+        "Model 2: Second-Order Ego State Negotiations\n"
+        "This model considers the nuanced perspectives of nine sub-ego states (Parent-in-Parent, Adult-in-Parent, etc.). "
+        "It mimics a more complex negotiation process with internal 'clusters' and cross-cluster horse-trading, before arriving at a weighted consensus."
+    ),
     "model3": (
-    "Model 3: Maslow-TA Decision Matrix\n"
-    "This model evaluates the decision's impact on each ego state, tiered by the levels of Maslow’s Hierarchy of Needs. "
-    "The matrix approach highlights where core needs are at risk, and calculates an overall utility score to drive the recommendation."
-)
+        "Model 3: Maslow-TA Decision Matrix\n"
+        "This model evaluates the decision's impact on each ego state, tiered by the levels of Maslow’s Hierarchy of Needs. "
+        "The matrix approach highlights where core needs are at risk, and calculates an overall utility score to drive the recommendation."
+    ),
+    "model4": (
+        "Model 4: Trichotomic Classical Decomposition\n"
+        "This model decomposes each decision outcome into three classical strands: Ethos (principle/duty), Logos (mechanism/rationality), and Energeia (active benefit/motivation). "
+        "Each strand is assigned to a different ego state (Parent, Adult, Child) for assessment. "
+        "After independent and integrated assessment, the ego states debate their preferred options and arrive at a group conclusion."
+    )
 }
+
 
 def add_spoken_synopsis_to_doc(doc, results):
     '''
@@ -2825,14 +3229,12 @@ def main():
     '''
     Main entry point for the Decisionator tool.
     '''
+    if DEBUG_MODE:
+        open(DEBUG_DUMP_PATH, "w", encoding="utf-8").close()  # Clear previous contents
+
     if OPENAI_API_KEY == "your-openai-api-key-here":
         print("ERROR: Please set your OpenAI API key in the OPENAI_API_KEY variable")
         return
-
-    if DEBUG_MODE:
-        test_line = "* **Financial Urgency:** The family needs significant income soon to pay for his daughter's school fees (due in 2 weeks: ~$300 USD equivalent) and general living expenses."
-        debug_process_specific_md_line(test_line)
-    
 
     # Prompt user for problem
     print("Please enter the decision problem you want to analyze.")
@@ -2849,6 +3251,7 @@ def main():
             empty_line_count = 0
             problem_lines.append(line)
     problem = "\n".join(problem_lines).strip()
+    debug_dump("Raw user input", problem)
     while not problem:
         print("The question cannot be blank. Please enter a valid question.")
         print("Please enter the decision problem you want to analyze.")
@@ -2865,6 +3268,28 @@ def main():
                 empty_line_count = 0
                 problem_lines.append(line)
         problem = "\n".join(problem_lines).strip()
+        debug_dump("Raw user input", problem)
+
+    # Prompt for ancillary/background/context info (supports multi-line with double ENTER to finish)
+    print("If you want to add any extra background or context information to help the analysis,")
+    print("you may enter as many lines as you wish. To finish, press Enter twice on consecutive empty lines (i.e., press Enter, then press Enter again).")
+    print("If you do not wish to provide any, just press Enter twice to skip.")
+    ancillary_lines = []
+    empty_line_count = 0
+    ancillary_info = ""  # Always defined, even if user skips
+    while True:
+        line = input()
+        if not line:
+            empty_line_count += 1
+            if empty_line_count >= 2:
+                break
+        else:
+            empty_line_count = 0
+            ancillary_lines.append(line)
+    if ancillary_lines:
+        ancillary_info = "\n".join(ancillary_lines).strip()
+    # else: ancillary_info remains as empty string
+    
 
     docasm = DocAssembler()
     controller = WorkflowController()
@@ -2878,18 +3303,31 @@ def main():
     else:
         docasm.add_paragraph(problem.strip())
 
+    # Add ancillary/background/context info to the doc for transparency
+    docasm.add_heading("Ancillary Background/Context", level=2)
+    if ancillary_info:
+        if is_markdown(ancillary_info):
+            docasm.add_markdown(ancillary_info)
+        else:
+            docasm.add_paragraph(ancillary_info)
+    else:
+        docasm.add_paragraph("(None provided)")
+
     # ==== Extract options ====
-    print("\nDetecting decision options in the problem statement...")
+    print("\n[INFO] Step 1: Detecting decision options in the problem statement...")
     options = controller.extract_options(problem)
     if not options:
         print("No options were extracted from the problem. Please rephrase your problem or check your input.")
         sys.exit(1)
-    print("Options detected:")
+    print("[INFO] Options detected:")
     for opt in options:
         print(f"{opt['id']}: {get_option_text(opt)}")
-
+    
+    print("\n[INFO] Step 2: Predicting the most likely outcome for each option...")
     # === After extracting options, determine likely outcomes for each option ===
+    MAX_RETRIES = 3
     likely_outcomes = []
+    ancillary_block = f"\n**Background/Context:**\n{ancillary_info}\n" if ancillary_info else ""
     for opt in options:
         prompt = f'''
 You are an expert in scenario analysis. Your task is to predict the **most likely realistic outcome** for the given decision option.
@@ -2902,6 +3340,7 @@ You are an expert in scenario analysis. Your task is to predict the **most likel
 - Your outcome should represent what *actually* would most probably happen, not an ideal or worst-case, but the typical or most expected result.
 - Be specific and practical.
 
+{ancillary_block}
 **Option:** "{get_option_text(opt)}"
 **Full Problem Context:** "{problem}"
 
@@ -2912,37 +3351,79 @@ Return as JSON with fields:
   "likely_outcome": "<provide the most probable, concrete outcome here>"
 }}
 '''
-        response = controller._call_openai_api(prompt)
-        data = controller._handle_json_parse(response)
-        likely_outcomes.append(data)
+        attempt = 0
+        while attempt < MAX_RETRIES:
+            response = controller._call_openai_api(prompt)
+            data = controller._handle_json_parse(response)
+            if (
+                isinstance(data, dict)
+                and all(k in data for k in ("option_id", "option_text", "likely_outcome"))
+                and "__error__" not in data
+            ):
+                likely_outcomes.append(data)
+                break
+            else:
+                print(f"[WARN] API response incomplete or malformed for option '{get_option_text(opt)}' (attempt {attempt+1}): {data}")
+                attempt += 1
+                if attempt >= MAX_RETRIES:
+                    print(f"[ERROR] All retries failed for option '{get_option_text(opt)}'. Skipping.")
+                    # Optionally, add a stub or just skip; here we skip the bad entry.
+                    break
 
+    
     print("\nLikely outcomes for each option:")
     for item in likely_outcomes:
         print(f"- {item.get('option_text', '[MISSING]')}: {item.get('likely_outcome', '[NO OUTCOME]')}")
 
+    print("\n[INFO] Step 3: Screening options for unacceptable (deleterious) outcomes (death, impossibility, or illegality)...")
     # === Appraise (option, outcome) pairs for deleterious results ===
     filtered_pairs = []
     rejection_reasons = []
+
     for item in likely_outcomes:
         prompt = f'''
-Evaluate the following decision context. If choosing this option and the likely outcome as described would result in death or injury (to self or others), a logical impossibility, or breaking the law, say so.
-Context:
-Option: "{item['option_text']}"
-Likely outcome: "{item['likely_outcome']}"
-Return JSON:
-{{"is_deleterious": true/false, "reason": "<explanation>"}}
-'''
-        resp = controller._call_openai_api(prompt)
-        check = controller._handle_json_parse(resp)
-        if check.get("is_deleterious"):
-            rejection_reasons.append({
-                "option_text": item['option_text'],
-                "likely_outcome": item['likely_outcome'],
-                "reason": check.get("reason", "")
-            })
-        else:
-            filtered_pairs.append(item)
+You are an expert in risk evaluation and ethical decision analysis.
 
+Given the following decision option and its most likely outcome, judge ONLY whether choosing this option would result in **(a)** immediate or inevitable death or injury to anyone, **(b)** a logical impossibility (physically or causally impossible), or **(c)** a clear and direct violation of criminal or civil law.
+
+- **Do NOT mark options as deleterious just because they are risky, financially harmful, stressful, or cause hardship, unless they meet the above criteria.**
+- **Do NOT flag long-term risks, potential for future harm, or subjective undesirability.**
+- Focus solely on strict disqualification: death, injury, logical impossibility, or clear illegality.
+
+Return JSON ONLY:
+{{
+  "is_deleterious": true/false,
+  "reason": "<brief explanation if true, or 'Not disqualified' if false>"
+}}
+
+Context:
+Option: "{item.get('option_text', '[MISSING]')}"
+Likely outcome: "{item.get('likely_outcome', '[NO OUTCOME]')}"
+'''
+        attempt = 0
+        while attempt < MAX_RETRIES:
+            resp = controller._call_openai_api(prompt)
+            check = controller._handle_json_parse(resp)
+            if isinstance(check, dict) and "is_deleterious" in check and "__error__" not in check:
+                if check.get("is_deleterious"):
+                    rejection_reasons.append({
+                        "option_text": item.get('option_text', '[MISSING]'),
+                        "likely_outcome": item.get('likely_outcome', '[NO OUTCOME]'),
+                        "reason": check.get("reason", "")
+                    })
+                else:
+                    filtered_pairs.append(item)
+                break
+            else:
+                print(f"[WARN] API response incomplete or malformed during deleterious check for '{item.get('option_text','?')}' (attempt {attempt+1}): {check}")
+                attempt += 1
+                if attempt >= MAX_RETRIES:
+                    print(f"[ERROR] All retries failed during deleterious check for '{item.get('option_text','?')}'. Treating as non-deleterious and proceeding.")
+                    filtered_pairs.append(item)
+                    break
+    # --- Always define this, even if empty, for use throughout code ---
+    rejection_by_option = {rej['option_text']: rej for rej in rejection_reasons}
+    
     # If all are rejected, print explanations and abort:
     if not filtered_pairs:
         print("\nAll possible courses of action and their likely outcomes were rejected due to deleterious consequences:")
@@ -2951,7 +3432,7 @@ Return JSON:
         print("No further decision processing can continue for this problem.")
         sys.exit(0)
 
-    print("\nSurviving (option, likely outcome) pairs:")
+    print("\n[INFO] Surviving (option, likely outcome) pairs after filtering:")
     for item in filtered_pairs:
         print(f"- {item.get('option_text', '[MISSING]')}: {item.get('likely_outcome', '[NO OUTCOME]')}")
 
@@ -2971,25 +3452,28 @@ Return JSON:
     print("     - Considers nine sub-ego states and mimics a complex negotiation with weighted consensus.\n")
     print("  3: Maslow-TA Decision Matrix")
     print("     - Evaluates how each option meets the levels of Maslow’s Hierarchy of Needs, using a utility score.\n")
-    print("  4: All models (recommended for full analysis)")
+    print("  4: Trichotomic Classical Decomposition Model")
+    print("     - Decomposes each option into Ethos, Logos, Energeia, and passes each to the relevant ego state for assessment, with a group discussion for the final decision.\n")
+    print("  5: All models (recommended for full analysis)")
 
     model_choice = None
-    valid_choices = {"1", "2", "3", "4"}
+    valid_choices = {"1", "2", "3", "4", "5"}
     while True:
-        inp = input("Enter the number (1, 2, 3, or 4) of the model to run [4=all]: ").strip()
+        inp = input("Enter the number (1, 2, 3, 4, or 5) of the model to run [5=all]: ").strip()
         if inp in valid_choices:
-            if inp == "4":
+            if inp == "5":
                 model_choice = "all"
             else:
                 model_choice = int(inp)
             break
-        print("Invalid input. Please enter 1, 2, 3, or 4.")
+        print("Invalid input. Please enter 1, 2, 3, 4, or 5.")
 
     if model_choice == "all":
         models_to_run = [
             DecisionModel.DEMOCRATIC_COUNCIL,
             DecisionModel.SECOND_ORDER_NEGOTIATIONS,
-            DecisionModel.MASLOW_TA_MATRIX
+            DecisionModel.MASLOW_TA_MATRIX,
+            "model4"
         ]
     elif model_choice == 1:
         models_to_run = [DecisionModel.DEMOCRATIC_COUNCIL]
@@ -2997,156 +3481,269 @@ Return JSON:
         models_to_run = [DecisionModel.SECOND_ORDER_NEGOTIATIONS]
     elif model_choice == 3:
         models_to_run = [DecisionModel.MASLOW_TA_MATRIX]
+    elif model_choice == 4:
+        models_to_run = ["model4"]
     else:
         print("No valid model selected, exiting.")
         sys.exit(1)
 
     print("\nRunning the following models:")
     for m in models_to_run:
-        print(" -", m.name.replace("_", " ").title())
+        if isinstance(m, str):
+            print(" - Trichotomic Classical Decomposition Model")
+        else:
+            print(" -", m.name.replace("_", " ").title())
 
     results = {}
     everyday_summaries = {}
     steps_by_model = {}
 
-    # ==== Considerations by Option (Chapter 3) ====
-    docasm.add_page_break()
-    docasm.add_heading("Decision Considerations (by Option)", level=1)
-    docasm.add_markdown(
-        "The considerations listed below are grouped by decision option and categorized as follows:\n"
-        "- **Negative:** Arguments against choosing this option, based on possible negative outcomes if it is chosen. These are typically shown with negative scores.\n"
-        "- **Avoidance:** Arguments in favor of this option, specifically because *not* choosing it would lead to negative consequences. These are preventative or risk-avoiding reasons and are scored positively.\n"
-        "- **Positive:** Arguments directly in favor of this option, based on desirable outcomes if it is chosen. These also have positive scores.\n\n"
-        "Where several considerations are highly similar, they are grouped together and summarized with an introductory sentence and bullet points."
-    )
 
-    # --- Run models and collect considerations ---
+    # ==== Step 1: Run models and collect all results/summaries/steps ====
+    results = {}
+    everyday_summaries = {}
+    steps_by_model = {}
+    
+    print(f"[INFO] Running {len(models_to_run)} decision models. This can take several minutes...")
     for i, model in enumerate(models_to_run):
-        model_label = model.value
-        print(f"\n{'='*10} Running Model {i+1}: {model.name.replace('_', ' ').title()} {'='*10}")
-        model_steps = []
-        def log_step(step_name, data):
-            model_steps.append({'step': step_name, 'data': data})
-        temp_considerations = []
-        result = controller.execute_workflow(
-            model,
-            problem,
-            options,
-            filtered_pairs,
-            doc=None,
-            considerations=temp_considerations,
-            log_callback=log_step
-        )
-        processor.add_many(temp_considerations)
-        results[model_label] = result
-        steps_by_model[model_label] = model_steps
-
-        everyday_prompt = controller._everyday_language_summary_prompt(problem, asdict(result))
-        everyday_summary = controller._call_openai_api(everyday_prompt)
-        everyday_summaries[model_label] = everyday_summary
-
-    # -- Group considerations by option --
-    grouped = {get_option_text(opt): processor.by_option_text(get_option_text(opt)) for opt in options}
-    general_cons = processor.general()
-    all_cons = processor.all()
-
-    # ---- Compute normalization for all considerations ----
-    neg_scores = [float(c.score) for c in all_cons if c.type == "negative" and c.score is not None and float(c.score) < 0]
-    pos_scores = [float(c.score) for c in all_cons if c.type in ("positive", "avoidance") and c.score is not None and float(c.score) > 0]
-    min_neg = min(neg_scores) if neg_scores else -1
-    max_pos = max(pos_scores) if pos_scores else 1
-
-    # Build a mapping from option_text to rejection reason for easy lookup
-    rejection_by_option = {rej['option_text']: rej for rej in rejection_reasons}
-
-    for opt in options:
-        opt_text = get_option_text(opt)
-        conslist = grouped.get(opt_text, [])
-        conslist = dedupe_considerations(conslist, similarity_cutoff=0.95)
-
-        docasm.add_heading(f"{opt['id']}: {get_option_text(opt)}", level=2)
-
-        # If this option was rejected, print its rejection reason and skip table
-        if opt_text in rejection_by_option:
-            rej = rejection_by_option[opt_text]
-            docasm.add_markdown(
-                f"This option was **rejected and excluded from further analysis** because:\n\n"
-                f"{rej['reason']}\n\n"
-                f"**Likely outcome if chosen:** {rej['likely_outcome']}"
+        if isinstance(model, str) and model.strip().lower() == "model4":
+            print(f"\n{'='*10} Running Model 4: Trichotomic Classical Decomposition {'='*10}")
+            result = controller.execute_model4(
+                problem,
+                options,
+                filtered_pairs,
+                doc=None,
+                considerations=None,
+                log_callback=None,
+                ancillary_info=ancillary_info,
             )
-            continue
+            results["model4"] = result
+            everyday_prompt = controller._everyday_language_summary_prompt(problem, asdict(result))
+            everyday_summary = controller._call_openai_api(everyday_prompt)
+            everyday_summaries["model4"] = everyday_summary
+            steps_by_model["model4"] = []
+        else:
+            model_label = model.value
+            print(f"\n{'='*10} Running Model {i+1}: {model.name.replace('_', ' ').title()} {'='*10}")
+            model_steps = []
+            def log_step(step_name, data):
+                model_steps.append({'step': step_name, 'data': data})
+            temp_considerations = []
+            result = controller.execute_workflow(
+                model,
+                problem,
+                options,
+                filtered_pairs,
+                doc=None,
+                considerations=temp_considerations,
+                log_callback=log_step
+            )
+            processor.add_many(temp_considerations)
+            results[model_label] = result
+            steps_by_model[model_label] = model_steps
+    
+            everyday_prompt = controller._everyday_language_summary_prompt(problem, asdict(result))
+            everyday_summary = controller._call_openai_api(everyday_prompt)
+            everyday_summaries[model_label] = everyday_summary
+    
+    # ==== Step 2: Conditionally write Considerations chapter ====
+    is_only_model4 = (
+        isinstance(models_to_run, list) and
+        len(models_to_run) == 1 and
+        isinstance(models_to_run[0], str) and
+        models_to_run[0].strip().lower() == "model4"
+    )
+    if not is_only_model4:
+        docasm.add_page_break()
+        docasm.add_heading("Decision Considerations (by Option)", level=1)
+        docasm.add_markdown(
+            "The considerations listed below are grouped by decision option and categorized as follows:\n"
+            "- **Negative:** Arguments against choosing this option, based on possible negative outcomes if it is chosen. These are typically shown with negative scores.\n"
+            "- **Avoidance:** Arguments in favor of this option, specifically because *not* choosing it would lead to negative consequences. These are preventative or risk-avoiding reasons and are scored positively.\n"
+            "- **Positive:** Arguments directly in favor of this option, based on desirable outcomes if it is chosen. These also have positive scores.\n\n"
+            "Where several considerations are highly similar, they are grouped together and summarized with an introductory sentence and bullet points."
+        )
+    
+        # -- Group considerations by option --
+        grouped = {get_option_text(opt): processor.by_option_text(get_option_text(opt)) for opt in options}
+        general_cons = processor.general()
+        all_cons = processor.all()
+    
+        # ---- Compute normalization for all considerations ----
+        neg_scores = [float(c.score) for c in all_cons if c.type == "negative" and c.score is not None and float(c.score) < 0]
+        pos_scores = [float(c.score) for c in all_cons if c.type in ("positive", "avoidance") and c.score is not None and float(c.score) > 0]
+        min_neg = min(neg_scores) if neg_scores else -1
+        max_pos = max(pos_scores) if pos_scores else 1
+    
+        # Build a mapping from option_text to rejection reason for easy lookup
+        rejection_by_option = {rej['option_text']: rej for rej in rejection_reasons}
+    
+        for opt in options:
+            opt_text = get_option_text(opt)
+            conslist = grouped.get(opt_text, [])
+            conslist = dedupe_considerations(conslist, similarity_cutoff=0.95)
+    
+            docasm.add_heading(f"{opt['id']}: {get_option_text(opt)}", level=2)
+    
+            # If this option was rejected, print its rejection reason and skip table
+            if opt_text in rejection_by_option:
+                rej = rejection_by_option[opt_text]
+                docasm.add_markdown(
+                    f"This option was **rejected and excluded from further analysis** because:\n\n"
+                    f"{rej['reason']}\n\n"
+                    f"**Likely outcome if chosen:** {rej['likely_outcome']}"
+                )
+                continue
+    
+            if not conslist:
+                docasm.add_paragraph("No considerations for this option.")
+                continue
+    
+            # --- NEW AI-BASED GROUPING AND MERGING ---
+            merged_groups = merge_considerations_conceptually(conslist, controller, context_prompt=problem)
+            table = docasm.add_table(rows=1, cols=3)
+            hdr_cells = table.rows[0].cells
+            hdr_cells[0].text = 'Consideration'
+            hdr_cells[1].text = 'Type'
+            hdr_cells[2].text = 'Score'
+            style_table(table)
+    
+            for group in merged_groups:
+                row_cells = table.add_row().cells
+                docasm.add_markdown_to_cell(row_cells[0], group['merged_text'])
+                row_cells[1].text = str(group['type'])
+                row_cells[2].text = f"{group['score']:.2f}" if group['score'] is not None else ''
+                try:
+                    s = float(group['score'])
+                except Exception:
+                    s = 0
+                if s < 0 or s > 0:
+                    hexcolor = get_heatmap_color(s, min_neg, max_pos, group['type'])
+                    if hexcolor:
+                        for cell in row_cells:
+                            cell._tc.get_or_add_tcPr().append(
+                                parse_xml(r'<w:shd {} w:fill="{}"/>'.format(nsdecls('w'), hexcolor))
+                            )
+    
+        # --- General considerations as usual ---
+        docasm.add_heading("General Considerations (Not Tied to a Single Option)", level=2)
+        general_cons_short = dedupe_considerations(general_cons, similarity_cutoff=0.95)
+        if general_cons_short:
+            merged_groups = merge_considerations_conceptually(general_cons_short, controller, context_prompt=problem)
+            table = docasm.add_table(rows=1, cols=3)
+            hdr_cells = table.rows[0].cells
+            hdr_cells[0].text = 'Consideration'
+            hdr_cells[1].text = 'Type'
+            hdr_cells[2].text = 'Score'
+            style_table(table)
+    
+            for group in merged_groups:
+                row_cells = table.add_row().cells
+                docasm.add_markdown_to_cell(row_cells[0], group['merged_text'])
+                row_cells[1].text = str(group['type'])
+                row_cells[2].text = f"{group['score']:.2f}" if group['score'] is not None else ''
+                try:
+                    s = float(group['score'])
+                except Exception:
+                    s = 0
+                if s < 0 or s > 0:
+                    hexcolor = get_heatmap_color(s, min_neg, max_pos, group['type'])
+                    if hexcolor:
+                        for cell in row_cells:
+                            cell._tc.get_or_add_tcPr().append(
+                                parse_xml(r'<w:shd {} w:fill="{}"/>'.format(nsdecls('w'), hexcolor))
+                            )
+        else:
+            docasm.add_paragraph("No general considerations were raised.")
+    
+    # ==== Add chapter: Model 4: Trichotomic Classical Decomposition Output ====
+    if "model4" in results:
+        model4_result = results["model4"]
+        docasm.add_page_break()
+        docasm.add_heading("Trichotomic Classical Decomposition Model", level=1)
+        docasm.add_heading("Integrated Analysis of Each Eventuality", level=2)
+    
+        # Index overall assessments by option for quick lookup
+        oa_by_option = {oa['option']: oa for oa in model4_result.overall_assessments}
+    
+        for decomp in model4_result.decompositions:
+            docasm.add_heading(f"Option: {decomp.option}", level=3)
+            docasm.add_heading("Likely Outcome", level=4)
+            docasm.add_paragraph(decomp.likely_outcome)
+    
+            # If only Model 4 is run and this option was rejected, show the reason here
+            if is_only_model4 and decomp.option in rejection_by_option:
+                rej = rejection_by_option[decomp.option]
+                docasm.add_markdown(
+                    f"This option was **rejected and excluded from further analysis** because:\n\n"
+                    f"{rej['reason']}\n\n"
+                    f"**Likely outcome if chosen:** {rej['likely_outcome']}"
+                )
+    
+            # Trichotomic Analysis
+            docasm.add_heading("Trichotomic Analysis", level=4)
+            tricho_lines = [
+                f"**Ethos**: {decomp.ethos or 'No ethos aspect mentioned.'}",
+                f"**Logos**: {decomp.logos or 'No logos aspect mentioned.'}",
+                f"**Energeia**: {decomp.energeia or 'No energeia aspect mentioned.'}",
+            ]
+            docasm.add_markdown('\n'.join([f"* {line}" for line in tricho_lines]))
+    
+            # Strand Assessments and Overall Assessment (as continuation)
+            oa = oa_by_option.get(decomp.option)
+            if oa:
+                docasm.add_heading("Strand Assessments", level=4)
+                for strand in ["Ethos", "Logos", "Energeia"]:
+                    found = False
+                    for s in oa['strand_assessments']:
+                        if s['strand'].lower() == strand.lower():
+                            docasm.add_markdown(
+                                f"* **{s['strand']} ({s['ego_state']}):** {s['assessment']} (Score: {s['score']})"
+                            )
+                            found = True
+                    if not found:
+                        docasm.add_markdown(f"* **{strand}:** No assessment available.")
+    
+                docasm.add_heading("Overall Assessment", level=4)
+                docasm.add_paragraph(f"{oa['overall_assessment']} (Score: {oa['score']})")
+                docasm.add_paragraph(f"Reasoning: {oa['reasoning']}")
+    
+        # Section 4: Strandwise Best Choices
+        docasm.add_heading("Strandwise Best Choices (Parent/Ethos, Adult/Logos, Child/Energeia)", level=2)
+        for strand in ["Ethos", "Logos", "Energeia"]:
+            best = model4_result.strandwise_best.get(strand)
+            if best:
+                docasm.add_heading(f"{strand}: Best Option", level=3)
+                docasm.add_paragraph(f"{best['best_option']}")
+                docasm.add_paragraph(f"Reasoning: {best['reasoning']}")
+    
+        # Section 5: Final Ego State Discussion and Conclusion
+        docasm.add_heading("Final Group Discussion and Sensible Conclusion", level=2)
+        docasm.add_heading("Final Decision", level=3)
+        docasm.add_paragraph(f"{model4_result.final_conclusion['final_decision']}")
+        docasm.add_heading("Reasoning", level=3)
+        docasm.add_paragraph(f"{model4_result.final_conclusion['reasoning']}")
 
-        if not conslist:
-            docasm.add_paragraph("No considerations for this option.")
-            continue
-
-        # --- NEW AI-BASED GROUPING AND MERGING ---
-        merged_groups = merge_considerations_conceptually(conslist, controller, context_prompt=problem)
-        table = docasm.add_table(rows=1, cols=3)
-        hdr_cells = table.rows[0].cells
-        hdr_cells[0].text = 'Consideration'
-        hdr_cells[1].text = 'Type'
-        hdr_cells[2].text = 'Score'
-        style_table(table)
-
-        for group in merged_groups:
-            row_cells = table.add_row().cells
-            docasm.add_markdown_to_cell(row_cells[0], group['merged_text'])
-            row_cells[1].text = str(group['type'])
-            row_cells[2].text = f"{group['score']:.2f}" if group['score'] is not None else ''
-            try:
-                s = float(group['score'])
-            except Exception:
-                s = 0
-            if s < 0 or s > 0:
-                hexcolor = get_heatmap_color(s, min_neg, max_pos, group['type'])
-                if hexcolor:
-                    for cell in row_cells:
-                        cell._tc.get_or_add_tcPr().append(
-                            parse_xml(r'<w:shd {} w:fill="{}"/>'.format(nsdecls('w'), hexcolor))
-                        )
-
-    # --- General considerations as usual ---
-    docasm.add_heading("General Considerations (Not Tied to a Single Option)", level=2)
-    general_cons_short = dedupe_considerations(general_cons, similarity_cutoff=0.95)
-    if general_cons_short:
-        merged_groups = merge_considerations_conceptually(general_cons_short, controller, context_prompt=problem)
-        table = docasm.add_table(rows=1, cols=3)
-        hdr_cells = table.rows[0].cells
-        hdr_cells[0].text = 'Consideration'
-        hdr_cells[1].text = 'Type'
-        hdr_cells[2].text = 'Score'
-        style_table(table)
-
-        for group in merged_groups:
-            row_cells = table.add_row().cells
-            docasm.add_markdown_to_cell(row_cells[0], group['merged_text'])
-            row_cells[1].text = str(group['type'])
-            row_cells[2].text = f"{group['score']:.2f}" if group['score'] is not None else ''
-            try:
-                s = float(group['score'])
-            except Exception:
-                s = 0
-            if s < 0 or s > 0:
-                hexcolor = get_heatmap_color(s, min_neg, max_pos, group['type'])
-                if hexcolor:
-                    for cell in row_cells:
-                        cell._tc.get_or_add_tcPr().append(
-                            parse_xml(r'<w:shd {} w:fill="{}"/>'.format(nsdecls('w'), hexcolor))
-                        )
-    else:
-        docasm.add_paragraph("No general considerations were raised.")
-
-    # ==== Chapter 2: Summaries and Conclusions ====
+    print("\n[INFO]: Generating summary conclusions and recommendations...")
+    # ==== Add Chapter: Summaries and Conclusions ====
     docasm.add_page_break()
     docasm.add_heading("Summary Conclusions and Recommendations", level=1)
     docasm.add_paragraph(
         "This section collects each model’s everyday-language summary and provides the AI's overall recommendation."
     )
 
-    for model_label in [m.value for m in models_to_run]:
-        docasm.add_heading(f"{model_label.upper()} Model Summary", level=2)
-        docasm.add_markdown(everyday_summaries[model_label])
+    # Robust model label handling: get the correct key for both enums and 'model4'
+    for model in models_to_run:
+        model_label = model.value if not isinstance(model, str) else model
+        nice_title = {
+            "model1": "Democratic Ego State Council Model Summary",
+            "model2": "Second-Order Ego State Negotiations Model Summary",
+            "model3": "Maslow-TA Decision Matrix Model Summary",
+            "model4": "Trichotomic Classical Decomposition Model Summary"
+        }.get(model_label, f"{model_label.upper()} Model Summary")
+        docasm.add_heading(nice_title, level=2)
+        docasm.add_markdown(renumber_markdown_lists(everyday_summaries[model_label]))
+
 
     # Build the overall summary prompt dynamically (robust for any model subset)
     summary_lines = [
@@ -3156,20 +3753,25 @@ Return JSON:
         f"Original Question:\n{problem}",
         ""
     ]
-    for model_label in [m.value for m in models_to_run]:
+    # Add each model's summary, with user-friendly names
+    for model in models_to_run:
+        model_label = model.value if not isinstance(model, str) else model
         model_name_nice = {
             "model1": "Model 1: Democratic Ego State Council",
             "model2": "Model 2: Second-Order Ego State Negotiations",
-            "model3": "Model 3: Maslow-TA Decision Matrix"
+            "model3": "Model 3: Maslow-TA Decision Matrix",
+            "model4": "Model 4: Trichotomic Classical Decomposition"
         }.get(model_label, model_label.upper())
         summary_lines.append(f"{model_name_nice} Summary:\n{everyday_summaries[model_label]}\n")
+
     summary_lines.append(
         "**Please give your conclusion and recommendation for a general audience, using clear narrative or bullet points in Markdown. Do not use JSON or code blocks. Only refer to the models and summaries given above.**"
     )
     overall_prompt = "\n".join(summary_lines)
     overall_summary = controller._call_openai_api(overall_prompt)
     docasm.add_heading("Overall Conclusion and Recommendation", level=2)
-    docasm.add_markdown(overall_summary)
+    docasm.add_markdown(renumber_markdown_lists(overall_summary))
+
 
     ##Uncomment the following code block if detailed working for each model is required.
     '''
